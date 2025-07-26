@@ -846,15 +846,108 @@ test_connectivity() {
         all_tests_passed=false
     fi
     
-    # Check if we can reach internet through VPN network simulation
-    log "INFO" "Проверка маршрутизации VPN трафика..."
-    if ip route add 1.1.1.1/32 dev "$WG_INTERFACE" 2>/dev/null; then
-        if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
-            log "SUCCESS" "VPN маршрутизация работает корректно"
+    # Detailed VPN traffic routing test
+    log "INFO" "Детальная проверка маршрутизации VPN трафика..."
+    
+    # Show current routing table
+    log "DEBUG" "Текущая таблица маршрутизации:"
+    ip route show | while read route; do
+        log "DEBUG" "  $route"
+    done
+    
+    # Show iptables rules in detail
+    log "DEBUG" "Детальная проверка правил iptables:"
+    
+    # INPUT rules
+    log "DEBUG" "INPUT правила (WireGuard порт):"
+    iptables -L INPUT -n -v --line-numbers | grep -E "(Chain|$WG_PORT|udp)" | while read line; do
+        log "DEBUG" "  $line"
+    done
+    
+    # FORWARD rules
+    log "DEBUG" "FORWARD правила (VPN интерфейс):"
+    iptables -L FORWARD -n -v --line-numbers | grep -E "(Chain|$WG_INTERFACE|ACCEPT|RELATED)" | while read line; do
+        log "DEBUG" "  $line"
+    done
+    
+    # NAT rules with details
+    log "DEBUG" "NAT POSTROUTING правила (MASQUERADE):"
+    iptables -t nat -L POSTROUTING -n -v --line-numbers | while read line; do
+        log "DEBUG" "  $line"
+    done
+    
+    # Test VPN routing with detailed output
+    log "INFO" "Тестирование маршрутизации через VPN интерфейс..."
+    
+    # Test 1: Add test route
+    local test_ip="1.1.1.1"
+    if ip route add $test_ip/32 dev "$WG_INTERFACE" 2>&1 | tee -a "$LOG_FILE"; then
+        log "SUCCESS" "Тестовый маршрут добавлен: $test_ip -> $WG_INTERFACE"
+        
+        # Show the added route
+        log "DEBUG" "Проверка добавленного маршрута:"
+        ip route show $test_ip | while read route; do
+            log "DEBUG" "  $route"
+        done
+        
+        # Test ping with detailed output
+        log "INFO" "Тест ping через VPN интерфейс..."
+        if ping -c 1 -W 3 -I "$WG_INTERFACE" $test_ip 2>&1 | tee -a "$LOG_FILE"; then
+            log "SUCCESS" "Ping через VPN интерфейс успешен"
         else
-            log "WARN" "Проблемы с маршрутизацией VPN трафика"
+            log "ERROR" "Ping через VPN интерфейс неуспешен"
+            
+            # Additional diagnostics
+            log "DEBUG" "Дополнительная диагностика:"
+            log "DEBUG" "Статус интерфейса $WG_INTERFACE:"
+            ip addr show "$WG_INTERFACE" | while read line; do
+                log "DEBUG" "  $line"
+            done
+            
+            log "DEBUG" "ARP таблица:"
+            arp -a | head -5 | while read line; do
+                log "DEBUG" "  $line"
+            done
         fi
-        ip route del 1.1.1.1/32 dev "$WG_INTERFACE" 2>/dev/null || true
+        
+        # Clean up test route
+        ip route del $test_ip/32 dev "$WG_INTERFACE" 2>/dev/null || true
+        log "INFO" "Тестовый маршрут удален"
+    else
+        log "ERROR" "Не удалось добавить тестовый маршрут"
+    fi
+    
+    # Test 2: Check packet forwarding capability
+    log "INFO" "Проверка возможности пересылки пакетов..."
+    
+    # Check if packets can flow from VPN network to internet
+    local vpn_test_ip="10.0.0.100"  # Simulated client IP
+    
+    # Test with iptables tracing (if available)
+    if command -v iptables-save >/dev/null 2>&1; then
+        log "DEBUG" "Количество правил в каждой цепочке:"
+        iptables -L INPUT -n | grep -c "^ACCEPT\|^DROP\|^REJECT" | xargs -I {} log "DEBUG" "  INPUT: {} правил"
+        iptables -L FORWARD -n | grep -c "^ACCEPT\|^DROP\|^REJECT" | xargs -I {} log "DEBUG" "  FORWARD: {} правил"
+        iptables -t nat -L POSTROUTING -n | grep -c "^MASQUERADE\|^SNAT" | xargs -I {} log "DEBUG" "  NAT POSTROUTING: {} правил"
+    fi
+    
+    # Test 3: Verify WireGuard interface can route to default gateway
+    local default_gw=$(ip route | awk '/default/ {print $3; exit}')
+    if [[ -n "$default_gw" ]]; then
+        log "INFO" "Тест маршрутизации к шлюзу по умолчанию: $default_gw"
+        if ping -c 1 -W 2 "$default_gw" >/dev/null 2>&1; then
+            log "SUCCESS" "Шлюз по умолчанию доступен: $default_gw"
+        else
+            log "WARN" "Проблемы с доступностью шлюза: $default_gw"
+        fi
+    fi
+    
+    # Test 4: Check conntrack if available
+    if command -v conntrack >/dev/null 2>&1; then
+        log "DEBUG" "Состояние connection tracking:"
+        conntrack -L 2>/dev/null | head -3 | while read line; do
+            log "DEBUG" "  $line"
+        done || log "DEBUG" "  Connection tracking пуст или недоступен"
     fi
     
     if $all_tests_passed; then
@@ -867,44 +960,136 @@ test_connectivity() {
     fi
 }
 
-# Show detailed debug information
+# Show detailed debug information with enhanced logging
 show_debug_info() {
-    log "STEP" "Сбор отладочной информации..."
+    log "STEP" "Сбор расширенной отладочной информации..."
     
     {
-        echo "=== DEBUG INFORMATION ==="
+        echo "=================================="
+        echo "    WIREGUARD DEBUG INFORMATION"
+        echo "=================================="
         echo "Date: $(date)"
+        echo "Script Version: v3.1 ULTIMATE"
         echo "OS: $OS $OS_VERSION"
         echo "WG Interface: $WG_INTERFACE"
         echo "WAN Interface: $WAN_INTERFACE"
         echo "Server Public IP: $SERVER_PUBLIC_IP"
         echo "VPN Network: $VPN_NETWORK"
         echo "Port: $WG_PORT"
+        echo "MTU: $OPTIMAL_MTU"
         echo
-        echo "=== NETWORK INTERFACES ==="
+        
+        echo "=== SYSTEM INFORMATION ==="
+        uname -a
+        echo "Uptime: $(uptime)"
+        echo "Memory: $(free -h | head -2 | tail -1)"
+        echo "Disk space: $(df -h / | tail -1)"
+        echo
+        
+        echo "=== NETWORK INTERFACES (DETAILED) ==="
         ip addr show
         echo
-        echo "=== ROUTING TABLE ==="
-        ip route show
+        echo "Link status:"
+        ip link show
         echo
-        echo "=== IPTABLES RULES ==="
-        iptables -L -n --line-numbers
+        
+        echo "=== ROUTING TABLES (DETAILED) ==="
+        echo "Main routing table:"
+        ip route show table main
         echo
-        echo "=== NAT RULES ==="
-        iptables -t nat -L -n
+        echo "Local routing table:"
+        ip route show table local | head -10
         echo
-        echo "=== WIREGUARD STATUS ==="
-        wg show
+        
+        echo "=== IPTABLES RULES (COMPLETE) ==="
+        echo "Filter table:"
+        iptables -L -n -v --line-numbers
         echo
-        echo "=== LISTENING PORTS ==="
-        netstat -ulpn | grep -E ":(51820|443)" || ss -ulpn | grep -E ":(51820|443)"
+        echo "NAT table:"
+        iptables -t nat -L -n -v --line-numbers
         echo
-        echo "=== SYSCTL SETTINGS ==="
+        echo "Mangle table:"
+        iptables -t mangle -L -n -v --line-numbers | head -20
+        echo
+        
+        echo "=== WIREGUARD STATUS (DETAILED) ==="
+        echo "WireGuard version:"
+        wg --version 2>/dev/null || echo "Version info not available"
+        echo
+        echo "WireGuard interfaces:"
+        wg show all
+        echo
+        echo "WireGuard configuration:"
+        wg showconf "$WG_INTERFACE" 2>/dev/null || echo "Config not available"
+        echo
+        
+        echo "=== NETWORK CONNECTIVITY TESTS ==="
+        echo "Ping to localhost:"
+        ping -c 1 127.0.0.1 2>&1 || echo "Localhost ping failed"
+        echo
+        echo "Ping to default gateway:"
+        ping -c 1 $(ip route | awk '/default/ {print $3; exit}') 2>&1 || echo "Gateway ping failed"
+        echo
+        echo "Ping to Google DNS:"
+        ping -c 1 8.8.8.8 2>&1 || echo "External ping failed"
+        echo
+        echo "DNS resolution test:"
+        nslookup google.com 2>&1 || echo "DNS resolution failed"
+        echo
+        
+        echo "=== PORT STATUS ==="
+        echo "All listening UDP ports:"
+        netstat -ulpn 2>/dev/null || ss -ulpn
+        echo
+        echo "WireGuard port specifically:"
+        netstat -ulpn 2>/dev/null | grep ":$WG_PORT " || ss -ulpn | grep ":$WG_PORT " || echo "WireGuard port not found"
+        echo
+        
+        echo "=== SYSTEM SETTINGS ==="
+        echo "IP forwarding:"
         sysctl net.ipv4.ip_forward
+        echo "Network settings:"
+        sysctl net.ipv4.conf.all.forwarding 2>/dev/null || echo "IPv4 forwarding setting not available"
+        sysctl net.ipv4.conf.all.accept_redirects 2>/dev/null || echo "Redirect setting not available"
         echo
+        
+        echo "=== PROCESS INFORMATION ==="
+        echo "WireGuard processes:"
+        ps aux | grep -E "(wireguard|wg-quick)" | grep -v grep || echo "No WireGuard processes found"
+        echo
+        
+        echo "=== KERNEL MODULES ==="
+        echo "WireGuard module:"
+        lsmod | grep wireguard || echo "WireGuard module not loaded"
+        echo "Network modules:"
+        lsmod | grep -E "(ip_tables|iptable_nat|nf_nat)" | head -5
+        echo
+        
+        echo "=== LOG FILES ==="
+        echo "Recent kernel messages:"
+        dmesg | tail -10 | grep -i wireguard || echo "No recent WireGuard kernel messages"
+        echo
+        echo "Recent system log:"
+        journalctl -n 5 --no-pager -q 2>/dev/null || echo "Journal not available"
+        echo
+        
+        echo "=== CONFIGURATION FILES ==="
+        echo "WireGuard server config:"
+        if [[ -f "$CONFIG_DIR/$WG_INTERFACE.conf" ]]; then
+            cat "$CONFIG_DIR/$WG_INTERFACE.conf"
+        else
+            echo "Config file not found: $CONFIG_DIR/$WG_INTERFACE.conf"
+        fi
+        echo
+        
+        echo "=================================="
+        echo "    END OF DEBUG INFORMATION"
+        echo "=================================="
+        
     } >> "$LOG_FILE"
     
-    log "SUCCESS" "Отладочная информация записана в $LOG_FILE"
+    log "SUCCESS" "Расширенная отладочная информация записана в $LOG_FILE"
+    log "INFO" "Общий размер лог-файла: $(du -h "$LOG_FILE" 2>/dev/null | cut -f1 || echo 'unknown')"
 }
 
 # Generate setup summary
@@ -1018,11 +1203,61 @@ main() {
     # Collect debug info before testing
     show_debug_info
     
+    # Enhanced connectivity test with detailed console output
+    log "INFO" "Запуск комплексного тестирования подключения..."
+    echo
+    echo -e "${CYAN}=== ДЕТАЛЬНАЯ ДИАГНОСТИКА ===${NC}"
+    
     if test_connectivity; then
-        log "SUCCESS" "Все проверки пройдены успешно!"
+        log "SUCCESS" "✅ Все проверки пройдены успешно!"
+        echo -e "${GREEN}✅ VPN сервер полностью функционален и готов к использованию${NC}"
     else
-        log "ERROR" "Некоторые проверки не прошли. Смотрите логи для диагностики."
+        log "WARN" "⚠️  Некоторые проблемы были обнаружены, но система попыталась их исправить"
+        echo -e "${YELLOW}⚠️  Рекомендуется проверить детальные логи для анализа${NC}"
+        echo -e "${YELLOW}📝 Полная диагностика доступна в: $LOG_FILE${NC}"
+        
+        # Show quick summary of potential issues
+        echo
+        echo -e "${CYAN}Краткий анализ возможных проблем:${NC}"
+        
+        # Check if interface is up
+        if ip link show "$WG_INTERFACE" &>/dev/null; then
+            echo -e "${GREEN}✅ Интерфейс $WG_INTERFACE активен${NC}"
+        else
+            echo -e "${RED}❌ Интерфейс $WG_INTERFACE не активен${NC}"
+        fi
+        
+        # Check if port is listening
+        if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
+            echo -e "${GREEN}✅ Порт $WG_PORT слушается${NC}"
+        else
+            echo -e "${RED}❌ Порт $WG_PORT не слушается${NC}"
+        fi
+        
+        # Check IP forwarding
+        if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]]; then
+            echo -e "${GREEN}✅ IP forwarding включен${NC}"
+        else
+            echo -e "${RED}❌ IP forwarding отключен${NC}"
+        fi
+        
+        # Check NAT rules
+        local nat_rules=$(iptables -t nat -L POSTROUTING -n | grep -c "$VPN_NETWORK" 2>/dev/null || echo "0")
+        if [[ "$nat_rules" -gt 0 ]]; then
+            echo -e "${GREEN}✅ NAT правила настроены ($nat_rules правил)${NC}"
+        else
+            echo -e "${RED}❌ NAT правила отсутствуют${NC}"
+        fi
+        
+        echo
+        echo -e "${CYAN}Для подробной диагностики выполните:${NC}"
+        echo -e "  ${YELLOW}tail -f $LOG_FILE${NC}"
+        echo -e "  ${YELLOW}wg show${NC}"
+        echo -e "  ${YELLOW}systemctl status wg-quick@$WG_INTERFACE${NC}"
     fi
+    
+    echo
+    echo -e "${CYAN}Размер лог-файла: $(du -h "$LOG_FILE" 2>/dev/null | cut -f1 || echo 'unknown')${NC}"
     
     # Summary
     show_setup_summary
