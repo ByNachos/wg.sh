@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# WireGuard Universal Setup Script - FIXED VERSION
+# WireGuard Universal Setup Script - ULTIMATE VERSION
 # One-script solution for complete WireGuard VPN server setup
-# Fixed all routing and internet connectivity issues
+# ULTIMATE EDITION: Fixed all connectivity issues + auto-diagnostics
 # Author: Senior Shell Developer
 # License: GPL v3
 
@@ -388,9 +388,9 @@ clear_existing_rules() {
     log "SUCCESS" "Существующие правила очищены"
 }
 
-# Configure iptables rules
+# Configure iptables rules - FIXED for proper internet access
 setup_firewall() {
-    log "STEP" "Настройка правил firewall..."
+    log "STEP" "Настройка правил firewall (ИСПРАВЛЕННАЯ ВЕРСИЯ)..."
     
     # Backup existing rules
     iptables-save > "$BACKUP_DIR/iptables-backup-$(date +%Y%m%d-%H%M%S).rules" 2>/dev/null || true
@@ -398,113 +398,153 @@ setup_firewall() {
     # Clear existing WireGuard rules first
     clear_existing_rules
     
-    # CRITICAL: Allow WireGuard port - this must be FIRST
+    # Get default gateway interface dynamically
+    local default_interface=$(ip route | awk '/default/ {print $5; exit}')
+    if [[ -z "$default_interface" ]]; then
+        default_interface="$WAN_INTERFACE"
+    fi
+    
+    log "INFO" "Используется интерфейс для интернета: $default_interface"
+    
+    # ESSENTIAL: Enable MASQUERADE for internet access - MUST BE FIRST
+    iptables -t nat -I POSTROUTING 1 -s "$VPN_NETWORK" -o "$default_interface" -j MASQUERADE
+    
+    # Allow WireGuard port - essential for VPN connections
     iptables -I INPUT 1 -p udp --dport "$WG_PORT" -j ACCEPT
     
-    # Allow forwarding for WireGuard interface
+    # Allow all traffic from/to WireGuard interface
     iptables -I FORWARD 1 -i "$WG_INTERFACE" -j ACCEPT
     iptables -I FORWARD 2 -o "$WG_INTERFACE" -j ACCEPT
     
-    # CRITICAL: MASQUERADE rule for VPN traffic - this is essential for internet access
-    iptables -t nat -A POSTROUTING -s "$VPN_NETWORK" -o "$WAN_INTERFACE" -j MASQUERADE
+    # Allow established and related connections (essential for two-way communication)
+    iptables -I FORWARD 3 -m state --state ESTABLISHED,RELATED -j ACCEPT
     
-    # Allow established and related connections
-    iptables -I FORWARD 3 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    
-    # MSS clamping for optimal packet handling
-    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-    
-    # Allow loopback
+    # Allow loopback (essential for local services)
     iptables -I INPUT 1 -i lo -j ACCEPT
+    iptables -I OUTPUT 1 -o lo -j ACCEPT
     
-    # Allow SSH (important - don't lock yourself out)
+    # Allow SSH (don't lock yourself out)
     iptables -I INPUT 2 -p tcp --dport 22 -j ACCEPT
+    iptables -I INPUT 3 -p tcp --dport 22 -m state --state ESTABLISHED -j ACCEPT
+    
+    # Allow DNS for proper resolution
+    iptables -I INPUT -p udp --dport 53 -j ACCEPT
+    iptables -I INPUT -p tcp --dport 53 -j ACCEPT
+    iptables -I OUTPUT -p udp --dport 53 -j ACCEPT
+    iptables -I OUTPUT -p tcp --dport 53 -j ACCEPT
+    
+    # Allow ICMP for ping and MTU discovery
+    iptables -I INPUT -p icmp -j ACCEPT
+    iptables -I FORWARD -p icmp -j ACCEPT
+    iptables -I OUTPUT -p icmp -j ACCEPT
+    
+    # MSS clamping for optimal packet handling (essential for mobile networks)
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    iptables -t mangle -A FORWARD -i "$WG_INTERFACE" -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
     
     # Allow fragmented packets
     iptables -I INPUT -f -j ACCEPT
     iptables -I FORWARD -f -j ACCEPT
     
-    # Optimize connection tracking
+    # Optimize connection tracking for better performance
     echo 1800 > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 2>/dev/null || true
     echo 120 > /proc/sys/net/netfilter/nf_conntrack_generic_timeout 2>/dev/null || true
+    echo 60 > /proc/sys/net/netfilter/nf_conntrack_udp_timeout 2>/dev/null || true
+    
+    # Additional optimizations for mobile connections
+    echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects 2>/dev/null || true
+    echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects 2>/dev/null || true
+    echo 1 > /proc/sys/net/ipv4/conf/all/accept_source_route 2>/dev/null || true
     
     # Save iptables rules permanently
     case "$OS" in
         *"Ubuntu"*|*"Debian"*)
+            # Ensure iptables-persistent is properly set up
+            mkdir -p /etc/iptables
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-            netfilter-persistent save 2>/dev/null || true
+            if command -v netfilter-persistent &> /dev/null; then
+                netfilter-persistent save 2>/dev/null || true
+            fi
             ;;
         *"CentOS"*|*"Red Hat"*|*"Rocky"*|*"AlmaLinux"*|*"Fedora"*)
-            service iptables save 2>/dev/null || true
+            if command -v iptables-save &> /dev/null; then
+                iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+            fi
+            if systemctl is-enabled iptables &> /dev/null; then
+                service iptables save 2>/dev/null || true
+            fi
             ;;
     esac
     
-    log "SUCCESS" "Правила firewall настроены и сохранены"
+    log "SUCCESS" "Правила firewall настроены и сохранены (ИСПРАВЛЕННАЯ ВЕРСИЯ)"
+    log "INFO" "MASQUERADE настроен для интерфейса: $default_interface"
     
     # Debug: Show current rules
-    log "DEBUG" "Текущие правила iptables:"
-    iptables -L -n --line-numbers | head -20 >> "$LOG_FILE" 2>/dev/null || true
-    iptables -t nat -L -n | head -10 >> "$LOG_FILE" 2>/dev/null || true
+    log "DEBUG" "Текущие правила iptables (первые 15 строк):"
+    iptables -L -n --line-numbers | head -15 >> "$LOG_FILE" 2>/dev/null || true
+    log "DEBUG" "NAT правила (POSTROUTING):"
+    iptables -t nat -L POSTROUTING -n -v >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# Create post-up script
-create_post_up_script() {
-    local post_up_script="$CONFIG_DIR/post-up.sh"
+# Create post-up and post-down scripts (external files)
+create_post_scripts() {
+    log "STEP" "Создание post-up и post-down скриптов..."
     
-    cat > "$post_up_script" << EOF
+    # Create post-up script
+    cat > "$CONFIG_DIR/post-up.sh" << 'EOF'
 #!/bin/bash
-# WireGuard post-up script - Universal optimization
-# Auto-generated by wg-universal-setup-fixed.sh
+# WireGuard Post-Up Script - Enable routing and NAT
+set -e
 
 # Enable IP forwarding
 echo 1 > /proc/sys/net/ipv4/ip_forward
 
-# Clear any existing rules for this interface
-iptables -D INPUT -p udp --dport $WG_PORT -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -i $WG_INTERFACE -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -o $WG_INTERFACE -j ACCEPT 2>/dev/null || true
-iptables -t nat -D POSTROUTING -s $VPN_NETWORK -o $WAN_INTERFACE -j MASQUERADE 2>/dev/null || true
+# Set optimal MTU
+ip link set dev %i mtu 1342
 
-# Add fresh rules
-iptables -I INPUT -p udp --dport $WG_PORT -j ACCEPT
-iptables -I FORWARD -i $WG_INTERFACE -j ACCEPT
-iptables -I FORWARD -o $WG_INTERFACE -j ACCEPT
-iptables -t nat -A POSTROUTING -s $VPN_NETWORK -o $WAN_INTERFACE -j MASQUERADE
-iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+# Allow WireGuard traffic through firewall
+iptables -I INPUT -p udp --dport %i -j ACCEPT 2>/dev/null || true
 
-# Universal optimizations
-ip link set dev $WG_INTERFACE mtu $OPTIMAL_MTU 2>/dev/null || true
+# Allow forwarding for VPN interface
+iptables -I FORWARD -i %i -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -o %i -j ACCEPT 2>/dev/null || true
 
-# Log
-echo "\$(date): WireGuard interface $WG_INTERFACE brought up" >> /var/log/wireguard.log
+# Enable NAT/MASQUERADE for internet access
+iptables -t nat -I POSTROUTING -s 10.0.0.0/24 -o $(ip route | awk '/default/ {print $5; exit}') -j MASQUERADE 2>/dev/null || true
+
+# Allow established and related connections
+iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+# Log successful execution
+echo "$(date): WireGuard post-up completed successfully" >> /var/log/wireguard.log
 EOF
-    
-    chmod +x "$post_up_script"
-    log "SUCCESS" "Post-up скрипт создан: $post_up_script"
-}
 
-# Create post-down script
-create_post_down_script() {
-    local post_down_script="$CONFIG_DIR/post-down.sh"
-    
-    cat > "$post_down_script" << EOF
+    # Create post-down script
+    cat > "$CONFIG_DIR/post-down.sh" << 'EOF'
 #!/bin/bash
-# WireGuard post-down script
-# Auto-generated by wg-universal-setup-fixed.sh
+# WireGuard Post-Down Script - Clean up routing and NAT
+set -e
 
-# Remove iptables rules
-iptables -D INPUT -p udp --dport $WG_PORT -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -i $WG_INTERFACE -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -o $WG_INTERFACE -j ACCEPT 2>/dev/null || true
-iptables -t nat -D POSTROUTING -s $VPN_NETWORK -o $WAN_INTERFACE -j MASQUERADE 2>/dev/null || true
+# Remove firewall rules (ignore errors if rules don't exist)
+iptables -D INPUT -p udp --dport %i -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
+iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o $(ip route | awk '/default/ {print $5; exit}') -j MASQUERADE 2>/dev/null || true
 iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
-# Log
-echo "\$(date): WireGuard interface $WG_INTERFACE brought down" >> /var/log/wireguard.log
+# Log successful execution
+echo "$(date): WireGuard post-down completed successfully" >> /var/log/wireguard.log
 EOF
+
+    # Make scripts executable
+    chmod +x "$CONFIG_DIR/post-up.sh"
+    chmod +x "$CONFIG_DIR/post-down.sh"
     
-    chmod +x "$post_down_script"
-    log "SUCCESS" "Post-down скрипт создан: $post_down_script"
+    # Replace port placeholder with actual port
+    sed -i "s/%i/$WG_PORT/g" "$CONFIG_DIR/post-up.sh"
+    sed -i "s/%i/$WG_PORT/g" "$CONFIG_DIR/post-down.sh"
+    
+    log "SUCCESS" "Post-up и post-down скрипты созданы и настроены"
 }
 
 # Create server configuration
@@ -520,9 +560,10 @@ create_server_config() {
     fi
     
     cat > "$config_file" << EOF
-# WireGuard Server Configuration - Universal Optimized FIXED
-# Generated by wg-universal-setup-fixed.sh on $(date)
+# WireGuard Server Configuration - ULTIMATE EDITION
+# Generated by wg-universal-setup.sh v3.1 on $(date)
 # Optimized for all device types with proven values
+# External post-up/post-down scripts for reliability
 
 [Interface]
 # Server private key
@@ -537,10 +578,10 @@ ListenPort = $WG_PORT
 # MTU optimized for universal device compatibility
 MTU = $OPTIMAL_MTU
 
-# Post-up script to configure routing and firewall
+# Post-up script - executed when interface comes up
 PostUp = $CONFIG_DIR/post-up.sh
 
-# Post-down script to clean up
+# Post-down script - executed when interface goes down
 PostDown = $CONFIG_DIR/post-down.sh
 
 # Client configurations will be added below
@@ -549,7 +590,7 @@ PostDown = $CONFIG_DIR/post-down.sh
 EOF
     
     chmod 600 "$config_file"
-    log "SUCCESS" "Конфигурация сервера создана: $config_file"
+    log "SUCCESS" "Конфигурация сервера создана с внешними post-up/post-down скриптами: $config_file"
     log "INFO" "Публичный ключ сервера: $SERVER_PUBLIC_KEY"
 }
 
@@ -661,70 +702,139 @@ start_wireguard() {
     fi
 }
 
-# Enhanced connectivity testing
+# Enhanced connectivity testing with auto-fix capabilities
 test_connectivity() {
-    log "STEP" "Расширенная проверка подключения..."
+    log "STEP" "Комплексная проверка подключения с автоисправлением..."
+    
+    local all_tests_passed=true
     
     # Test if interface is up
     if ip link show "$WG_INTERFACE" &>/dev/null; then
         log "SUCCESS" "Интерфейс $WG_INTERFACE активен"
         
         # Show interface details
-        local interface_info=$(ip addr show "$WG_INTERFACE" 2>/dev/null || echo "Информация недоступна")
-        log "INFO" "Информация об интерфейсе: $interface_info"
+        local interface_info=$(ip addr show "$WG_INTERFACE" 2>/dev/null | head -3)
+        log "INFO" "Интерфейс: $interface_info"
         
         # Show WireGuard status
-        local wg_status=$(wg show "$WG_INTERFACE" 2>/dev/null || echo "Статус недоступен")
-        log "INFO" "Статус WireGuard: $wg_status"
+        local wg_status=$(wg show "$WG_INTERFACE" 2>/dev/null || echo "Нет подключенных клиентов")
+        log "INFO" "WireGuard статус: $wg_status"
     else
         log "ERROR" "Интерфейс $WG_INTERFACE не активен"
-        return 1
+        all_tests_passed=false
     fi
     
     # Test basic internet connectivity from server
     log "INFO" "Проверка интернет-соединения сервера..."
-    if ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1; then
+    if ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1; then
         log "SUCCESS" "Сервер имеет доступ к интернету"
     else
         log "ERROR" "Сервер не имеет доступа к интернету"
-        return 1
+        all_tests_passed=false
     fi
     
     # Test DNS resolution
     log "INFO" "Проверка DNS разрешения..."
-    if nslookup google.com >/dev/null 2>&1; then
+    if nslookup google.com >/dev/null 2>&1 || dig google.com >/dev/null 2>&1; then
         log "SUCCESS" "DNS разрешение работает"
     else
         log "WARN" "Проблемы с DNS разрешением"
+        # Try to fix DNS
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+        log "INFO" "DNS серверы исправлены на 8.8.8.8 и 1.1.1.1"
     fi
     
-    # Test MTU
-    log "INFO" "Проверка MTU..."
-    if ping -c 1 -s $((OPTIMAL_MTU - 28)) -M do 8.8.8.8 >/dev/null 2>&1; then
-        log "SUCCESS" "MTU $OPTIMAL_MTU оптимален"
+    # Check IP forwarding
+    log "INFO" "Проверка IP forwarding..."
+    local ip_forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "0")
+    if [[ "$ip_forward" == "1" ]]; then
+        log "SUCCESS" "IP forwarding включен"
     else
-        log "WARN" "Возможны проблемы с MTU $OPTIMAL_MTU"
+        log "ERROR" "IP forwarding отключен!"
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        log "INFO" "IP forwarding принудительно включен"
+        all_tests_passed=false
     fi
     
-    # Check iptables rules
+    # Check iptables rules - CRITICAL for internet access
     log "INFO" "Проверка правил iptables..."
-    if iptables -t nat -L POSTROUTING -n | grep -q "$VPN_NETWORK"; then
-        log "SUCCESS" "Правила NAT настроены корректно"
+    local nat_rules=$(iptables -t nat -L POSTROUTING -n | grep -c "$VPN_NETWORK" || echo "0")
+    if [[ "$nat_rules" -gt 0 ]]; then
+        log "SUCCESS" "Правила NAT настроены корректно ($nat_rules правил)"
     else
-        log "ERROR" "Правила NAT отсутствуют!"
-        return 1
+        log "ERROR" "Правила NAT отсутствуют! Исправляем..."
+        # Emergency fix for missing NAT rules
+        local default_interface=$(ip route | awk '/default/ {print $5; exit}')
+        iptables -t nat -I POSTROUTING 1 -s "$VPN_NETWORK" -o "$default_interface" -j MASQUERADE
+        iptables -I FORWARD 1 -i "$WG_INTERFACE" -j ACCEPT
+        iptables -I FORWARD 1 -o "$WG_INTERFACE" -j ACCEPT
+        log "SUCCESS" "Правила NAT добавлены принудительно"
+        all_tests_passed=false
     fi
     
-    # Check if WireGuard port is open
-    log "INFO" "Проверка доступности порта WireGuard..."
+    # Check if WireGuard port is listening
+    log "INFO" "Проверка порта WireGuard..."
     if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
         log "SUCCESS" "Порт $WG_PORT открыт и слушается"
     else
         log "ERROR" "Порт $WG_PORT не слушается!"
-        return 1
+        log "INFO" "Попытка перезапуска WireGuard..."
+        wg-quick down "$WG_INTERFACE" 2>/dev/null || true
+        sleep 2
+        wg-quick up "$WG_INTERFACE" 2>/dev/null || true
+        sleep 2
+        if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
+            log "SUCCESS" "Порт $WG_PORT теперь активен после перезапуска"
+        else
+            log "ERROR" "Не удалось активировать порт $WG_PORT"
+            all_tests_passed=false
+        fi
     fi
     
-    return 0
+    # Test MTU and packet handling
+    log "INFO" "Проверка MTU и обработки пакетов..."
+    if ping -c 1 -s $((OPTIMAL_MTU - 28)) -M do 8.8.8.8 >/dev/null 2>&1; then
+        log "SUCCESS" "MTU $OPTIMAL_MTU оптимален"
+    else
+        log "WARN" "Возможны проблемы с MTU $OPTIMAL_MTU"
+        # Try smaller MTU
+        if ping -c 1 -s 1200 -M do 8.8.8.8 >/dev/null 2>&1; then
+            log "INFO" "MTU 1200 работает, возможна фрагментация"
+        fi
+    fi
+    
+    # Additional network diagnostics
+    log "INFO" "Дополнительная диагностика сети..."
+    
+    # Check default route
+    local default_route=$(ip route show default 2>/dev/null | head -1)
+    if [[ -n "$default_route" ]]; then
+        log "SUCCESS" "Маршрут по умолчанию: $default_route"
+    else
+        log "ERROR" "Отсутствует маршрут по умолчанию!"
+        all_tests_passed=false
+    fi
+    
+    # Check if we can reach internet through VPN network simulation
+    log "INFO" "Проверка маршрутизации VPN трафика..."
+    if ip route add 1.1.1.1/32 dev "$WG_INTERFACE" 2>/dev/null; then
+        if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+            log "SUCCESS" "VPN маршрутизация работает корректно"
+        else
+            log "WARN" "Проблемы с маршрутизацией VPN трафика"
+        fi
+        ip route del 1.1.1.1/32 dev "$WG_INTERFACE" 2>/dev/null || true
+    fi
+    
+    if $all_tests_passed; then
+        log "SUCCESS" "Все проверки пройдены успешно!"
+        return 0
+    else
+        log "WARN" "Некоторые проблемы были исправлены автоматически"
+        log "INFO" "Рекомендуется проверить логи для деталей"
+        return 1
+    fi
 }
 
 # Show detailed debug information
@@ -868,8 +978,7 @@ main() {
     setup_firewall
     
     # WireGuard configuration
-    create_post_up_script
-    create_post_down_script
+    create_post_scripts
     create_server_config
     create_client_configs
     
@@ -895,7 +1004,7 @@ main() {
 show_usage() {
     echo "Использование: $0 [ОПЦИИ]"
     echo
-    echo "WireGuard Universal Setup Script v3.0 FIXED"
+    echo "WireGuard Universal Setup Script v3.1 ULTIMATE"
     echo "Полностью автоматическая установка и настройка VPN сервера"
     echo
     echo "Опции:"
@@ -922,7 +1031,7 @@ case "${1:-}" in
         exit 0
         ;;
     -v|--version)
-        echo "WireGuard Universal Setup Script v3.0 FIXED"
+        echo "WireGuard Universal Setup Script v3.1 ULTIMATE"
         exit 0
         ;;
     "")
