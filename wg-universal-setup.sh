@@ -308,13 +308,67 @@ choose_port() {
             ;;
     esac
     
-    # Check if port is available
-    if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
+    # Enhanced port conflict detection
+    log "INFO" "Проверка доступности порта $WG_PORT..."
+    
+    # Check what's using the port
+    local port_usage=$(netstat -ulpn 2>/dev/null | grep ":$WG_PORT " || ss -ulpn 2>/dev/null | grep ":$WG_PORT " || echo "")
+    
+    if [[ -n "$port_usage" ]]; then
         log "WARN" "Порт $WG_PORT уже занят!"
-        read -p "Продолжить с этим портом? [y/N]: " continue_anyway
-        if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
-            error_exit "Установка прервана из-за занятого порта"
+        log "INFO" "Детали использования порта:"
+        echo "$port_usage" | while read line; do
+            log "INFO" "  $line"
+        done
+        
+        # Try to identify what's using the port
+        local process_info=$(lsof -i UDP:$WG_PORT 2>/dev/null || echo "Процесс не определен")
+        if [[ "$process_info" != "Процесс не определен" ]]; then
+            log "INFO" "Процессы, использующие порт:"
+            echo "$process_info" | while read line; do
+                log "INFO" "  $line"
+            done
         fi
+        
+        # Check if it's another WireGuard instance
+        if echo "$port_usage" | grep -q "wg\|wireguard"; then
+            log "INFO" "Порт используется другим экземпляром WireGuard"
+            read -p "Остановить существующий WireGuard и продолжить? [y/N]: " stop_existing
+            if [[ "$stop_existing" =~ ^[Yy]$ ]]; then
+                log "INFO" "Остановка существующих WireGuard интерфейсов..."
+                wg-quick down all 2>/dev/null || true
+                systemctl stop wg-quick@* 2>/dev/null || true
+                sleep 2
+                
+                # Check if port is now free
+                if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
+                    log "WARN" "Порт всё ещё занят после остановки WireGuard"
+                else
+                    log "SUCCESS" "Порт $WG_PORT теперь свободен"
+                fi
+            fi
+        fi
+        
+        # Final check and user decision
+        if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
+            echo
+            echo -e "${YELLOW}Внимание! Порт $WG_PORT всё ещё занят.${NC}"
+            echo "Это может вызвать конфликты или неработоспособность VPN."
+            echo
+            read -p "Продолжить несмотря на конфликт? [y/N]: " continue_anyway
+            if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
+                echo
+                echo -e "${CYAN}Рекомендации:${NC}"
+                echo "1. Выберите другой порт (перезапустите скрипт)"
+                echo "2. Остановите процесс, использующий порт $WG_PORT"
+                echo "3. Перезагрузите сервер для очистки всех соединений"
+                error_exit "Установка прервана из-за конфликта портов"
+            else
+                log "WARN" "Продолжение с конфликтующим портом - могут быть проблемы"
+            fi
+        fi
+    else
+        log "SUCCESS" "Порт $WG_PORT свободен"
     fi
     
     log "SUCCESS" "Будет использован порт: $WG_PORT"
@@ -399,18 +453,71 @@ optimize_tcp_settings() {
     log "SUCCESS" "TCP настройки оптимизированы"
 }
 
-# Clear any existing iptables rules for WireGuard
+# Clear any existing iptables rules for WireGuard - ENHANCED
 clear_existing_rules() {
-    log "STEP" "Очистка существующих правил iptables..."
+    log "STEP" "Тщательная очистка существующих правил iptables..."
     
-    # Remove any existing WireGuard rules
-    iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$WG_INTERFACE" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -o "$WG_INTERFACE" -j ACCEPT 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -o "$WAN_INTERFACE" -j MASQUERADE 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -s "$VPN_NETWORK" -o "$WAN_INTERFACE" -j MASQUERADE 2>/dev/null || true
+    # Count existing rules before cleanup
+    local input_before=$(iptables -L INPUT -n --line-numbers | grep -c "udp dpt:$WG_PORT\|udp dpt:51820\|udp dpt:443" || echo "0")
+    local forward_before=$(iptables -L FORWARD -n --line-numbers | grep -c "$WG_INTERFACE" || echo "0")
+    local nat_before=$(iptables -t nat -L POSTROUTING -n --line-numbers | grep -c "$VPN_NETWORK" || echo "0")
     
-    log "SUCCESS" "Существующие правила очищены"
+    log "INFO" "Найдено правил для удаления: INPUT=$input_before, FORWARD=$forward_before, NAT=$nat_before"
+    
+    # Remove all WireGuard-related INPUT rules (multiple ports)
+    while iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null; do
+        log "DEBUG" "Удалено INPUT правило для порта $WG_PORT"
+    done
+    
+    # Remove rules for common WireGuard ports if different
+    for port in 51820 443; do
+        if [[ "$port" != "$WG_PORT" ]]; then
+            while iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; do
+                log "DEBUG" "Удалено старое INPUT правило для порта $port"
+            done
+        fi
+    done
+    
+    # Remove all WireGuard interface FORWARD rules
+    while iptables -D FORWARD -i "$WG_INTERFACE" -j ACCEPT 2>/dev/null; do
+        log "DEBUG" "Удалено FORWARD правило для входящего $WG_INTERFACE"
+    done
+    
+    while iptables -D FORWARD -o "$WG_INTERFACE" -j ACCEPT 2>/dev/null; do
+        log "DEBUG" "Удалено FORWARD правило для исходящего $WG_INTERFACE"
+    done
+    
+    # Remove state-related FORWARD rules that might conflict
+    while iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do
+        log "DEBUG" "Удалено FORWARD правило для ESTABLISHED,RELATED"
+    done
+    
+    while iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do
+        log "DEBUG" "Удалено FORWARD правило для conntrack"
+    done
+    
+    # Remove NAT rules for VPN network
+    while iptables -t nat -D POSTROUTING -s "$VPN_NETWORK" -o "$WAN_INTERFACE" -j MASQUERADE 2>/dev/null; do
+        log "DEBUG" "Удалено NAT правило для $VPN_NETWORK -> $WAN_INTERFACE"
+    done
+    
+    # Also try to remove with any interface
+    while iptables -t nat -D POSTROUTING -s "$VPN_NETWORK" -j MASQUERADE 2>/dev/null; do
+        log "DEBUG" "Удалено общее NAT правило для $VPN_NETWORK"
+    done
+    
+    # Count remaining rules after cleanup
+    local input_after=$(iptables -L INPUT -n --line-numbers | grep -c "udp dpt:$WG_PORT\|udp dpt:51820\|udp dpt:443" || echo "0")
+    local forward_after=$(iptables -L FORWARD -n --line-numbers | grep -c "$WG_INTERFACE" || echo "0")
+    local nat_after=$(iptables -t nat -L POSTROUTING -n --line-numbers | grep -c "$VPN_NETWORK" || echo "0")
+    
+    log "SUCCESS" "Очистка завершена. Осталось правил: INPUT=$input_after, FORWARD=$forward_after, NAT=$nat_after"
+    
+    if [[ $input_after -eq 0 && $forward_after -eq 0 && $nat_after -eq 0 ]]; then
+        log "SUCCESS" "Все старые правила WireGuard успешно удалены"
+    else
+        log "WARN" "Некоторые правила могли остаться, но это не критично"
+    fi
 }
 
 # Configure iptables rules - FIXED for proper internet access
@@ -879,9 +986,54 @@ test_connectivity() {
     # Test VPN routing with detailed output
     log "INFO" "Тестирование маршрутизации через VPN интерфейс..."
     
-    # Test 1: Add test route
+    # Test 1: Enhanced VPN routing test
     local test_ip="1.1.1.1"
-    if ip route add $test_ip/32 dev "$WG_INTERFACE" 2>&1 | tee -a "$LOG_FILE"; then
+    log "INFO" "Тестирование маршрутизации VPN с диагностикой..."
+    
+    # First, test without special routing (should work through default route + NAT)
+    log "INFO" "Тест 1: Ping через обычную маршрутизацию..."
+    if ping -c 1 -W 3 $test_ip >/dev/null 2>&1; then
+        log "SUCCESS" "Обычный ping работает - интернет доступен"
+    else
+        log "ERROR" "Обычный ping не работает - проблемы с интернетом на сервере"
+        all_tests_passed=false
+    fi
+    
+    # Test 2: Check if VPN interface can route packets through MASQUERADE
+    log "INFO" "Тест 2: Проверка NAT для VPN сети..."
+    
+    # Simulate VPN client packet by using specific source IP
+    if ip addr add 10.0.0.100/32 dev "$WG_INTERFACE" 2>/dev/null; then
+        log "DEBUG" "Добавлен тестовый IP 10.0.0.100 на $WG_INTERFACE"
+        
+        # Test ping from VPN IP
+        if ping -c 1 -W 3 -I 10.0.0.100 $test_ip >/dev/null 2>&1; then
+            log "SUCCESS" "NAT работает корректно для VPN сети"
+        else
+            log "WARN" "Проблемы с NAT для VPN сети"
+            
+            # Additional NAT diagnostics
+            log "DEBUG" "Диагностика NAT:"
+            log "DEBUG" "Активные соединения conntrack:"
+            conntrack -L -s 10.0.0.0/24 2>/dev/null | head -3 | while read line; do
+                log "DEBUG" "  $line"
+            done || log "DEBUG" "  Conntrack недоступен или пуст"
+            
+            log "DEBUG" "NAT правила детально:"
+            iptables -t nat -L POSTROUTING -n -v | head -10 | while read line; do
+                log "DEBUG" "  $line"
+            done
+        fi
+        
+        # Clean up test IP
+        ip addr del 10.0.0.100/32 dev "$WG_INTERFACE" 2>/dev/null || true
+    else
+        log "WARN" "Не удалось добавить тестовый IP на интерфейс"
+    fi
+    
+    # Test 3: Direct route test (original test, but improved)
+    log "INFO" "Тест 3: Прямая маршрутизация через $WG_INTERFACE..."
+    if ip route add $test_ip/32 dev "$WG_INTERFACE" 2>/dev/null; then
         log "SUCCESS" "Тестовый маршрут добавлен: $test_ip -> $WG_INTERFACE"
         
         # Show the added route
@@ -890,24 +1042,13 @@ test_connectivity() {
             log "DEBUG" "  $route"
         done
         
-        # Test ping with detailed output
-        log "INFO" "Тест ping через VPN интерфейс..."
-        if ping -c 1 -W 3 -I "$WG_INTERFACE" $test_ip 2>&1 | tee -a "$LOG_FILE"; then
-            log "SUCCESS" "Ping через VPN интерфейс успешен"
+        # Test ping with verbose output but limited time
+        log "INFO" "Ping test через прямой маршрут (это может не работать и это нормально)..."
+        if timeout 5 ping -c 1 -W 2 $test_ip 2>&1 | head -10 | tee -a "$LOG_FILE"; then
+            log "SUCCESS" "Прямой ping через VPN интерфейс работает"
         else
-            log "ERROR" "Ping через VPN интерфейс неуспешен"
-            
-            # Additional diagnostics
-            log "DEBUG" "Дополнительная диагностика:"
-            log "DEBUG" "Статус интерфейса $WG_INTERFACE:"
-            ip addr show "$WG_INTERFACE" | while read line; do
-                log "DEBUG" "  $line"
-            done
-            
-            log "DEBUG" "ARP таблица:"
-            arp -a | head -5 | while read line; do
-                log "DEBUG" "  $line"
-            done
+            log "INFO" "Прямой ping не работает (это нормально - нужен подключенный клиент)"
+            log "INFO" "VPN будет работать когда подключится реальный клиент"
         fi
         
         # Clean up test route
@@ -915,6 +1056,51 @@ test_connectivity() {
         log "INFO" "Тестовый маршрут удален"
     else
         log "ERROR" "Не удалось добавить тестовый маршрут"
+    fi
+    
+    # Test 4: Check if real VPN traffic would work
+    log "INFO" "Тест 4: Проверка готовности для реального VPN трафика..."
+    
+    # Check all required components
+    local vpn_ready=true
+    
+    # Check WireGuard is listening
+    if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
+        log "DEBUG" "✅ WireGuard слушает на порту $WG_PORT"
+    else
+        log "DEBUG" "❌ WireGuard не слушает на порту $WG_PORT"
+        vpn_ready=false
+    fi
+    
+    # Check IP forwarding
+    if [[ "$(cat /proc/sys/net/ipv4/ip_forward)" == "1" ]]; then
+        log "DEBUG" "✅ IP forwarding включен"
+    else
+        log "DEBUG" "❌ IP forwarding отключен"
+        vpn_ready=false
+    fi
+    
+    # Check NAT rules
+    if iptables -t nat -C POSTROUTING -s "$VPN_NETWORK" -o "$WAN_INTERFACE" -j MASQUERADE 2>/dev/null; then
+        log "DEBUG" "✅ NAT правила настроены"
+    else
+        log "DEBUG" "❌ NAT правила не найдены"
+        vpn_ready=false
+    fi
+    
+    # Check FORWARD rules
+    if iptables -C FORWARD -i "$WG_INTERFACE" -j ACCEPT 2>/dev/null; then
+        log "DEBUG" "✅ FORWARD правила настроены"
+    else
+        log "DEBUG" "❌ FORWARD правила не найдены"
+        vpn_ready=false
+    fi
+    
+    if $vpn_ready; then
+        log "SUCCESS" "✅ VPN полностью готов для подключения клиентов"
+    else
+        log "WARN" "⚠️ Некоторые компоненты VPN настроены неправильно"
+        all_tests_passed=false
     fi
     
     # Test 2: Check packet forwarding capability
@@ -926,9 +1112,12 @@ test_connectivity() {
     # Test with iptables tracing (if available)
     if command -v iptables-save >/dev/null 2>&1; then
         log "DEBUG" "Количество правил в каждой цепочке:"
-        iptables -L INPUT -n | grep -c "^ACCEPT\|^DROP\|^REJECT" | xargs -I {} log "DEBUG" "  INPUT: {} правил"
-        iptables -L FORWARD -n | grep -c "^ACCEPT\|^DROP\|^REJECT" | xargs -I {} log "DEBUG" "  FORWARD: {} правил"
-        iptables -t nat -L POSTROUTING -n | grep -c "^MASQUERADE\|^SNAT" | xargs -I {} log "DEBUG" "  NAT POSTROUTING: {} правил"
+        local input_rules=$(iptables -L INPUT -n | grep -c "^ACCEPT\|^DROP\|^REJECT" || echo "0")
+        local forward_rules=$(iptables -L FORWARD -n | grep -c "^ACCEPT\|^DROP\|^REJECT" || echo "0")
+        local nat_rules=$(iptables -t nat -L POSTROUTING -n | grep -c "^MASQUERADE\|^SNAT" || echo "0")
+        log "DEBUG" "  INPUT: $input_rules правил"
+        log "DEBUG" "  FORWARD: $forward_rules правил"
+        log "DEBUG" "  NAT POSTROUTING: $nat_rules правил"
     fi
     
     # Test 3: Verify WireGuard interface can route to default gateway
