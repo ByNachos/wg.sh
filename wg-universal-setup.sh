@@ -538,18 +538,31 @@ setup_firewall() {
     
     log "INFO" "Используется интерфейс для интернета: $default_interface"
     
-    # ESSENTIAL: Enable MASQUERADE for internet access - MUST BE FIRST
+    # CRITICAL: Multiple MASQUERADE rules for maximum compatibility
+    # Rule 1: Basic MASQUERADE for VPN network
     iptables -t nat -I POSTROUTING 1 -s "$VPN_NETWORK" -o "$default_interface" -j MASQUERADE
+    
+    # Rule 2: More specific MASQUERADE for non-local traffic
+    iptables -t nat -I POSTROUTING 2 -s "$VPN_NETWORK" ! -d "$VPN_NETWORK" -o "$default_interface" -j MASQUERADE
+    
+    # Rule 3: Catch-all MASQUERADE for any interface (backup)
+    iptables -t nat -A POSTROUTING -s "$VPN_NETWORK" -j MASQUERADE
     
     # Allow WireGuard port - essential for VPN connections
     iptables -I INPUT 1 -p udp --dport "$WG_PORT" -j ACCEPT
     
-    # Allow all traffic from/to WireGuard interface
+    # CRITICAL: Allow ALL traffic from VPN interface (before any DROP policies)
     iptables -I FORWARD 1 -i "$WG_INTERFACE" -j ACCEPT
+    
+    # CRITICAL: Allow ALL traffic to VPN interface (for return packets)
     iptables -I FORWARD 2 -o "$WG_INTERFACE" -j ACCEPT
     
     # Allow established and related connections (essential for two-way communication)
     iptables -I FORWARD 3 -m state --state ESTABLISHED,RELATED -j ACCEPT
+    
+    # ADDITIONAL: Ensure no blocking rules affect VPN traffic
+    iptables -I FORWARD 4 -s "$VPN_NETWORK" -j ACCEPT
+    iptables -I FORWARD 5 -d "$VPN_NETWORK" -j ACCEPT
     
     # Allow loopback (essential for local services)
     iptables -I INPUT 1 -i lo -j ACCEPT
@@ -583,10 +596,18 @@ setup_firewall() {
     echo 120 > /proc/sys/net/netfilter/nf_conntrack_generic_timeout 2>/dev/null || true
     echo 60 > /proc/sys/net/netfilter/nf_conntrack_udp_timeout 2>/dev/null || true
     
+    # CRITICAL: Disable reverse path filtering (can block VPN traffic)
+    echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true
+    echo 0 > /proc/sys/net/ipv4/conf/"$default_interface"/rp_filter 2>/dev/null || true
+    echo 0 > /proc/sys/net/ipv4/conf/"$WG_INTERFACE"/rp_filter 2>/dev/null || true
+    
     # Additional optimizations for mobile connections
     echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects 2>/dev/null || true
     echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects 2>/dev/null || true
     echo 1 > /proc/sys/net/ipv4/conf/all/accept_source_route 2>/dev/null || true
+    
+    # Enable loose reverse path filtering for VPN interface
+    echo 2 > /proc/sys/net/ipv4/conf/"$WG_INTERFACE"/rp_filter 2>/dev/null || true
     
     # Save iptables rules permanently
     case "$OS" in
@@ -628,11 +649,11 @@ create_inline_commands() {
         default_interface="$WAN_INTERFACE"
     fi
     
-    # Create inline post-up commands (all in one line, separated by semicolons)
-    POST_UP_COMMANDS="echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -I INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -I FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -t nat -I POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    # Create enhanced inline post-up commands with multiple safeguards
+    POST_UP_COMMANDS="echo 1 > /proc/sys/net/ipv4/ip_forward; echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 0 > /proc/sys/net/ipv4/conf/$default_interface/rp_filter; iptables -I INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -I FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -s $VPN_NETWORK -j ACCEPT; iptables -I FORWARD -d $VPN_NETWORK -j ACCEPT; iptables -t nat -I POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -t nat -I POSTROUTING -s $VPN_NETWORK ! -d $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
     
-    # Create inline post-down commands
-    POST_DOWN_COMMANDS="iptables -D INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -D FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -D FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -t nat -D POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    # Create enhanced inline post-down commands
+    POST_DOWN_COMMANDS="iptables -D INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -D FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -D FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -D FORWARD -s $VPN_NETWORK -j ACCEPT; iptables -D FORWARD -d $VPN_NETWORK -j ACCEPT; iptables -t nat -D POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -t nat -D POSTROUTING -s $VPN_NETWORK ! -d $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
     
     log "SUCCESS" "Встроенные команды подготовлены для интерфейса: $default_interface"
     log "INFO" "Post-Up: $POST_UP_COMMANDS"
@@ -1372,6 +1393,7 @@ main() {
     
     # Network configuration
     get_server_ip
+    save_server_ip
     detect_interfaces
     choose_port
     generate_keys
@@ -1452,6 +1474,138 @@ main() {
     show_setup_summary
     
     log "SUCCESS" "Установка WireGuard завершена успешно!"
+    
+    # Add real-time client connection monitoring
+    echo
+    echo -e "${CYAN}=== МОНИТОРИНГ ПОДКЛЮЧЕНИЙ КЛИЕНТОВ ===${NC}"
+    echo -e "${YELLOW}Для диагностики проблем с интернетом запустите:${NC}"
+    echo -e "  ${GREEN}sudo bash $0 --monitor${NC}"
+    echo
+    echo -e "${YELLOW}Или проверьте подключения вручную:${NC}"
+    echo -e "  ${GREEN}watch -n 2 'wg show && echo && iptables -t nat -L POSTROUTING -n -v | head -10'${NC}"
+}
+
+# Real-time client connection monitoring
+monitor_connections() {
+    log "INFO" "Запуск мониторинга подключений клиентов..."
+    echo -e "${CYAN}Нажмите Ctrl+C для выхода${NC}"
+    echo
+    
+    while true; do
+        clear
+        echo -e "${CYAN}=== МОНИТОРИНГ WIREGUARD ПОДКЛЮЧЕНИЙ ===${NC}"
+        echo "Время: $(date)"
+        echo
+        
+        # Show WireGuard status
+        echo -e "${YELLOW}WireGuard статус:${NC}"
+        if wg show 2>/dev/null | grep -q "peer:"; then
+            wg show
+            echo
+            
+            # Show active connections with traffic
+            echo -e "${YELLOW}Активные соединения с трафиком:${NC}"
+            wg show all dump | while read line; do
+                if [[ "$line" =~ ^[a-zA-Z0-9+/=]+[[:space:]]+[a-zA-Z0-9+/=]+[[:space:]]+[0-9.]+ ]]; then
+                    echo "  $line"
+                fi
+            done
+            echo
+            
+            # Check NAT translations for connected clients
+            echo -e "${YELLOW}NAT трансляции для VPN клиентов:${NC}"
+            iptables -t nat -L POSTROUTING -n -v | grep "10.0.0" | head -5
+            echo
+            
+            # Show conntrack entries for VPN network
+            echo -e "${YELLOW}Активные соединения (conntrack):${NC}"
+            conntrack -L -s 10.0.0.0/24 2>/dev/null | head -5 || echo "  Нет активных соединений или conntrack недоступен"
+            echo
+            
+            # Test internet from server perspective
+            echo -e "${YELLOW}Тест интернета с сервера:${NC}"
+            if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+                echo -e "  ${GREEN}✅ Сервер имеет доступ к интернету${NC}"
+            else
+                echo -e "  ${RED}❌ Сервер НЕ имеет доступа к интернету${NC}"
+            fi
+            
+            # Check if any VPN client is sending traffic
+            local rx_bytes=$(wg show wg0 transfer | awk '{print $2}' | head -1)
+            local tx_bytes=$(wg show wg0 transfer | awk '{print $3}' | head -1)
+            
+            if [[ -n "$rx_bytes" && "$rx_bytes" != "0" ]]; then
+                echo -e "  ${GREEN}✅ Клиент отправляет данные (RX: $rx_bytes bytes)${NC}"
+            else
+                echo -e "  ${YELLOW}⚠️  Клиент не отправляет данные${NC}"
+            fi
+            
+            if [[ -n "$tx_bytes" && "$tx_bytes" != "0" ]]; then
+                echo -e "  ${GREEN}✅ Сервер отправляет данные клиенту (TX: $tx_bytes bytes)${NC}"
+            else
+                echo -e "  ${YELLOW}⚠️  Сервер не отправляет данные клиенту${NC}"
+            fi
+            
+        else
+            echo -e "  ${YELLOW}Нет подключенных клиентов${NC}"
+            echo
+            echo -e "${CYAN}Ожидание подключения клиентов...${NC}"
+            echo "Убедитесь что:"
+            echo "1. Клиент использует правильный IP сервера: $(cat /tmp/wg_server_ip 2>/dev/null || echo 'UNKNOWN')"
+            echo "2. Порт $WG_PORT открыт в firewall облачного провайдера"
+            echo "3. Конфигурация клиента правильная"
+        fi
+        
+        echo -e "${CYAN}Обновление через 3 секунды...${NC}"
+        sleep 3
+    done
+}
+
+# Diagnostic function to run when client is connected
+diagnose_client_connection() {
+    local client_ip="$1"
+    
+    log "INFO" "Диагностика подключения клиента $client_ip"
+    
+    # Check if client is in WireGuard
+    if ! wg show | grep -q "$client_ip"; then
+        log "ERROR" "Клиент $client_ip не найден в WireGuard"
+        return 1
+    fi
+    
+    # Test ping to client
+    log "INFO" "Тест ping к клиенту..."
+    if ping -c 3 -W 2 "$client_ip" >/dev/null 2>&1; then
+        log "SUCCESS" "Ping к клиенту $client_ip успешен"
+    else
+        log "ERROR" "Ping к клиенту $client_ip неуспешен"
+    fi
+    
+    # Check routing to client
+    log "INFO" "Проверка маршрутизации к клиенту..."
+    local route_to_client=$(ip route get "$client_ip" 2>/dev/null || echo "no route")
+    log "INFO" "Маршрут к $client_ip: $route_to_client"
+    
+    # Check if NAT is working for this client
+    log "INFO" "Проверка NAT для клиента..."
+    local nat_count=$(iptables -t nat -L POSTROUTING -n -v | grep -c "$client_ip" || echo "0")
+    log "INFO" "NAT правил для $client_ip: $nat_count"
+    
+    # Show conntrack entries for this client
+    log "INFO" "Активные соединения клиента:"
+    conntrack -L -s "$client_ip" 2>/dev/null | head -10 || log "INFO" "Нет активных соединений"
+    
+    # Test if server can masquerade traffic from this client
+    log "INFO" "Тест MASQUERADE для клиента..."
+    
+    # Add temporary route and test
+    if ip route add 1.1.1.1/32 via "$client_ip" dev wg0 2>/dev/null; then
+        log "INFO" "Временный маршрут добавлен"
+        sleep 1
+        ip route del 1.1.1.1/32 via "$client_ip" dev wg0 2>/dev/null || true
+    fi
+    
+    return 0
 }
 
 # Show usage information
@@ -1478,6 +1632,11 @@ show_usage() {
     echo "ИСПРАВЛЕНА проблема с отсутствием интернета в VPN."
 }
 
+# Save server IP for monitoring
+save_server_ip() {
+    echo "$SERVER_PUBLIC_IP" > /tmp/wg_server_ip 2>/dev/null || true
+}
+
 # Parse command line arguments
 case "${1:-}" in
     -h|--help)
@@ -1486,6 +1645,27 @@ case "${1:-}" in
         ;;
     -v|--version)
         echo "WireGuard Universal Setup Script v3.1 ULTIMATE"
+        exit 0
+        ;;
+    -m|--monitor)
+        if [[ $EUID -ne 0 ]]; then
+            echo "Мониторинг требует права root. Используйте: sudo $0 --monitor"
+            exit 1
+        fi
+        monitor_connections
+        exit 0
+        ;;
+    --diagnose)
+        if [[ $EUID -ne 0 ]]; then
+            echo "Диагностика требует права root. Используйте: sudo $0 --diagnose [IP_клиента]"
+            exit 1
+        fi
+        if [[ -n "${2:-}" ]]; then
+            diagnose_client_connection "$2"
+        else
+            echo "Укажите IP клиента для диагностики: $0 --diagnose 10.0.0.2"
+            exit 1
+        fi
         exit 0
         ;;
     "")
