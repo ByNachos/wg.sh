@@ -271,28 +271,53 @@ detect_interfaces() {
     log "SUCCESS" "WireGuard интерфейс: $WG_INTERFACE"
 }
 
-# Choose optimal port
+# Choose optimal port with user selection
 choose_port() {
-    log "STEP" "Выбор оптимального порта..."
+    log "STEP" "Выбор порта для WireGuard..."
     
-    # Check if default port is available
-    if ! netstat -ulpn 2>/dev/null | grep -q ":$DEFAULT_PORT " && ! ss -ulpn 2>/dev/null | grep -q ":$DEFAULT_PORT "; then
-        WG_PORT=$DEFAULT_PORT
-        log "SUCCESS" "Используется стандартный порт: $WG_PORT"
-    elif ! netstat -ulpn 2>/dev/null | grep -q ":$ALTERNATIVE_PORT " && ! ss -ulpn 2>/dev/null | grep -q ":$ALTERNATIVE_PORT "; then
-        WG_PORT=$ALTERNATIVE_PORT
-        log "INFO" "Стандартный порт занят, используется альтернативный: $WG_PORT"
-    else
-        log "WARN" "Оба рекомендуемых порта заняты"
-        read -p "Введите порт для WireGuard (1024-65535): " custom_port
-        if [[ "$custom_port" =~ ^[0-9]+$ ]] && [[ $custom_port -ge 1024 ]] && [[ $custom_port -le 65535 ]]; then
-            WG_PORT=$custom_port
-        else
-            error_exit "Неверный порт: $custom_port"
+    echo
+    echo -e "${CYAN}Выберите порт для WireGuard:${NC}"
+    echo "1) 51820 (стандартный порт WireGuard)"
+    echo "2) 443 (HTTPS порт - лучше проходит через firewall)"
+    echo "3) Ввести свой порт"
+    echo
+    
+    read -p "Ваш выбор [1-3]: " port_choice
+    
+    case "$port_choice" in
+        1)
+            WG_PORT=$DEFAULT_PORT
+            log "INFO" "Выбран стандартный порт: $WG_PORT"
+            ;;
+        2)
+            WG_PORT=$ALTERNATIVE_PORT
+            log "INFO" "Выбран HTTPS порт: $WG_PORT (лучше проходит через firewall)"
+            ;;
+        3)
+            read -p "Введите порт для WireGuard (1024-65535): " custom_port
+            if [[ "$custom_port" =~ ^[0-9]+$ ]] && [[ $custom_port -ge 1024 ]] && [[ $custom_port -le 65535 ]]; then
+                WG_PORT=$custom_port
+                log "INFO" "Выбран пользовательский порт: $WG_PORT"
+            else
+                error_exit "Неверный порт: $custom_port"
+            fi
+            ;;
+        *)
+            log "WARN" "Неверный выбор, используется стандартный порт"
+            WG_PORT=$DEFAULT_PORT
+            ;;
+    esac
+    
+    # Check if port is available
+    if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
+        log "WARN" "Порт $WG_PORT уже занят!"
+        read -p "Продолжить с этим портом? [y/N]: " continue_anyway
+        if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
+            error_exit "Установка прервана из-за занятого порта"
         fi
     fi
     
-    log "SUCCESS" "Порт WireGuard: $WG_PORT"
+    log "SUCCESS" "Будет использован порт: $WG_PORT"
 }
 
 # Generate cryptographic keys
@@ -486,75 +511,25 @@ setup_firewall() {
     iptables -t nat -L POSTROUTING -n -v >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# Create post-up and post-down scripts (external files)
-create_post_scripts() {
-    log "STEP" "Создание post-up и post-down скриптов..."
+# Create inline post-up and post-down commands
+create_inline_commands() {
+    log "STEP" "Подготовка встроенных post-up/post-down команд..."
     
-    # Create post-up script with correct variables
-    cat > "$CONFIG_DIR/post-up.sh" << EOF
-#!/bin/bash
-# WireGuard Post-Up Script - Enable routing and NAT
-set -e
-
-# Variables for this configuration
-WG_INTERFACE="$WG_INTERFACE"
-WG_PORT="$WG_PORT"
-VPN_NETWORK="$VPN_NETWORK"
-
-# Enable IP forwarding
-echo 1 > /proc/sys/net/ipv4/ip_forward
-
-# Set optimal MTU
-ip link set dev \$WG_INTERFACE mtu $OPTIMAL_MTU
-
-# Allow WireGuard traffic through firewall
-iptables -I INPUT -p udp --dport \$WG_PORT -j ACCEPT 2>/dev/null || true
-
-# Allow forwarding for VPN interface
-iptables -I FORWARD -i \$WG_INTERFACE -j ACCEPT 2>/dev/null || true
-iptables -I FORWARD -o \$WG_INTERFACE -j ACCEPT 2>/dev/null || true
-
-# Enable NAT/MASQUERADE for internet access
-DEFAULT_INTERFACE=\$(ip route | awk '/default/ {print \$5; exit}')
-iptables -t nat -I POSTROUTING -s \$VPN_NETWORK -o \$DEFAULT_INTERFACE -j MASQUERADE 2>/dev/null || true
-
-# Allow established and related connections
-iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
-# Log successful execution
-echo "\$(date): WireGuard post-up completed successfully for \$WG_INTERFACE" >> /var/log/wireguard.log
-EOF
-
-    # Create post-down script with correct variables
-    cat > "$CONFIG_DIR/post-down.sh" << EOF
-#!/bin/bash
-# WireGuard Post-Down Script - Clean up routing and NAT
-set -e
-
-# Variables for this configuration
-WG_INTERFACE="$WG_INTERFACE"
-WG_PORT="$WG_PORT"
-VPN_NETWORK="$VPN_NETWORK"
-
-# Remove firewall rules (ignore errors if rules don't exist)
-iptables -D INPUT -p udp --dport \$WG_PORT -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -i \$WG_INTERFACE -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -o \$WG_INTERFACE -j ACCEPT 2>/dev/null || true
-
-# Remove NAT rules
-DEFAULT_INTERFACE=\$(ip route | awk '/default/ {print \$5; exit}')
-iptables -t nat -D POSTROUTING -s \$VPN_NETWORK -o \$DEFAULT_INTERFACE -j MASQUERADE 2>/dev/null || true
-iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
-# Log successful execution
-echo "\$(date): WireGuard post-down completed successfully for \$WG_INTERFACE" >> /var/log/wireguard.log
-EOF
-
-    # Make scripts executable
-    chmod +x "$CONFIG_DIR/post-up.sh"
-    chmod +x "$CONFIG_DIR/post-down.sh"
+    # Get default interface dynamically
+    local default_interface=$(ip route | awk '/default/ {print $5; exit}')
+    if [[ -z "$default_interface" ]]; then
+        default_interface="$WAN_INTERFACE"
+    fi
     
-    log "SUCCESS" "Post-up и post-down скрипты созданы с правильными переменными"
+    # Create inline post-up commands (all in one line, separated by semicolons)
+    POST_UP_COMMANDS="echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -I INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -I FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -t nat -I POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    
+    # Create inline post-down commands
+    POST_DOWN_COMMANDS="iptables -D INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -D FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -D FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -t nat -D POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    
+    log "SUCCESS" "Встроенные команды подготовлены для интерфейса: $default_interface"
+    log "INFO" "Post-Up: $POST_UP_COMMANDS"
+    log "INFO" "Post-Down: $POST_DOWN_COMMANDS"
 }
 
 # Create server configuration
@@ -573,7 +548,7 @@ create_server_config() {
 # WireGuard Server Configuration - ULTIMATE EDITION
 # Generated by wg-universal-setup.sh v3.1 on $(date)
 # Optimized for all device types with proven values
-# External post-up/post-down scripts for reliability
+# Inline post-up/post-down commands for maximum reliability
 
 [Interface]
 # Server private key
@@ -582,17 +557,17 @@ PrivateKey = $SERVER_PRIVATE_KEY
 # Server IP address within VPN network
 Address = $SERVER_VPN_IP/24
 
-# Listen port - optimized for compatibility
+# Listen port - user selected for best compatibility
 ListenPort = $WG_PORT
 
 # MTU optimized for universal device compatibility
 MTU = $OPTIMAL_MTU
 
-# Post-up script - executed when interface comes up
-PostUp = $CONFIG_DIR/post-up.sh
+# Post-up commands - executed when interface comes up
+PostUp = $POST_UP_COMMANDS
 
-# Post-down script - executed when interface goes down
-PostDown = $CONFIG_DIR/post-down.sh
+# Post-down commands - executed when interface goes down  
+PostDown = $POST_DOWN_COMMANDS
 
 # Client configurations will be added below
 # Generated automatically
@@ -600,7 +575,7 @@ PostDown = $CONFIG_DIR/post-down.sh
 EOF
     
     chmod 600 "$config_file"
-    log "SUCCESS" "Конфигурация сервера создана с внешними post-up/post-down скриптами: $config_file"
+    log "SUCCESS" "Конфигурация сервера создана с встроенными post-up/post-down командами: $config_file"
     log "INFO" "Публичный ключ сервера: $SERVER_PUBLIC_KEY"
 }
 
@@ -691,24 +666,69 @@ create_client_configs() {
     log "SUCCESS" "Создано $CLIENT_COUNT клиентских конфигураций с правильным IP: $SERVER_PUBLIC_IP"
 }
 
-# Start WireGuard interface
+# Start WireGuard interface with enhanced error handling
 start_wireguard() {
     log "STEP" "Запуск WireGuard интерфейса..."
     
     # Stop any existing interface first
+    log "INFO" "Остановка существующих интерфейсов..."
     wg-quick down "$WG_INTERFACE" 2>/dev/null || true
+    ip link delete "$WG_INTERFACE" 2>/dev/null || true
     
-    if wg-quick up "$WG_INTERFACE"; then
-        log "SUCCESS" "WireGuard интерфейс $WG_INTERFACE запущен"
-        
-        # Enable systemd service
-        systemctl enable wg-quick@"$WG_INTERFACE" 2>/dev/null || true
-        log "SUCCESS" "WireGuard сервис включен для автозапуска"
-        
-        # Wait a moment for interface to be fully up
-        sleep 2
+    # Wait for cleanup
+    sleep 1
+    
+    # Validate configuration before starting
+    log "INFO" "Проверка конфигурации..."
+    if ! wg-quick strip "$WG_INTERFACE" >/dev/null 2>&1; then
+        log "ERROR" "Ошибка в конфигурации WireGuard!"
+        log "INFO" "Содержимое конфигурации:"
+        cat "$CONFIG_DIR/$WG_INTERFACE.conf" >> "$LOG_FILE"
+        error_exit "Некорректная конфигурация WireGuard"
+    fi
+    
+    # Try to start the interface
+    log "INFO" "Запуск интерфейса $WG_INTERFACE..."
+    if wg-quick up "$WG_INTERFACE" 2>&1 | tee -a "$LOG_FILE"; then
+        log "SUCCESS" "WireGuard интерфейс $WG_INTERFACE запущен успешно"
     else
-        error_exit "Не удалось запустить WireGuard интерфейс"
+        log "ERROR" "Ошибка при запуске WireGuard интерфейса"
+        log "INFO" "Попытка диагностики проблемы..."
+        
+        # Show detailed error information
+        log "DEBUG" "Проверка конфигурации:"
+        wg-quick strip "$WG_INTERFACE" 2>&1 | tee -a "$LOG_FILE" || true
+        
+        log "DEBUG" "Проверка сетевых интерфейсов:"
+        ip link show 2>&1 | tee -a "$LOG_FILE" || true
+        
+        error_exit "Не удалось запустить WireGuard интерфейс. Смотрите логи в $LOG_FILE"
+    fi
+    
+    # Wait for interface to be fully up
+    sleep 3
+    
+    # Verify interface is actually up
+    if ip link show "$WG_INTERFACE" &>/dev/null; then
+        log "SUCCESS" "Интерфейс $WG_INTERFACE активен"
+    else
+        error_exit "Интерфейс $WG_INTERFACE не активен после запуска"
+    fi
+    
+    # Enable systemd service
+    log "INFO" "Включение автозапуска..."
+    if systemctl enable wg-quick@"$WG_INTERFACE" 2>&1 | tee -a "$LOG_FILE"; then
+        log "SUCCESS" "WireGuard сервис включен для автозапуска"
+    else
+        log "WARN" "Не удалось включить автозапуск сервиса"
+    fi
+    
+    # Test if systemctl can manage the service
+    log "INFO" "Проверка управления сервисом..."
+    if systemctl is-active wg-quick@"$WG_INTERFACE" >/dev/null 2>&1; then
+        log "SUCCESS" "Сервис wg-quick@$WG_INTERFACE активен"
+    else
+        log "WARN" "Сервис не активен, но интерфейс работает"
     fi
 }
 
@@ -988,7 +1008,7 @@ main() {
     setup_firewall
     
     # WireGuard configuration
-    create_post_scripts
+    create_inline_commands
     create_server_config
     create_client_configs
     
