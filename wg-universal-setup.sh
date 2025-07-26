@@ -78,7 +78,7 @@ print_banner() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║                                                              ║"
-    echo "║        WireGuard Universal Setup Script v3.0 FIXED          ║"
+    echo "║        WireGuard Universal Setup Script v3.1 ULTIMATE       ║"
     echo "║                                                              ║"
     echo "║  Автоматическая настройка VPN сервера для всех устройств     ║"
     echo "║  Исправлены все проблемы с интернет-соединением             ║"
@@ -506,14 +506,18 @@ clear_existing_rules() {
         log "DEBUG" "Удалено общее NAT правило для $VPN_NETWORK"
     done
     
-    # Count remaining rules after cleanup
-    local input_after=$(iptables -L INPUT -n --line-numbers | grep -c "udp dpt:$WG_PORT\|udp dpt:51820\|udp dpt:443" || echo "0")
-    local forward_after=$(iptables -L FORWARD -n --line-numbers | grep -c "$WG_INTERFACE" || echo "0")
-    local nat_after=$(iptables -t nat -L POSTROUTING -n --line-numbers | grep -c "$VPN_NETWORK" || echo "0")
+    # Count remaining rules after cleanup (fix syntax error)
+    local input_after
+    local forward_after  
+    local nat_after
+    
+    input_after=$(iptables -L INPUT -n --line-numbers | grep -c "udp dpt:$WG_PORT\|udp dpt:51820\|udp dpt:443" 2>/dev/null || echo "0")
+    forward_after=$(iptables -L FORWARD -n --line-numbers | grep -c "$WG_INTERFACE" 2>/dev/null || echo "0")
+    nat_after=$(iptables -t nat -L POSTROUTING -n --line-numbers | grep -c "$VPN_NETWORK" 2>/dev/null || echo "0")
     
     log "SUCCESS" "Очистка завершена. Осталось правил: INPUT=$input_after, FORWARD=$forward_after, NAT=$nat_after"
     
-    if [[ $input_after -eq 0 && $forward_after -eq 0 && $nat_after -eq 0 ]]; then
+    if [[ "$input_after" -eq 0 && "$forward_after" -eq 0 && "$nat_after" -eq 0 ]]; then
         log "SUCCESS" "Все старые правила WireGuard успешно удалены"
     else
         log "WARN" "Некоторые правила могли остаться, но это не критично"
@@ -599,15 +603,12 @@ setup_firewall() {
     # CRITICAL: Disable reverse path filtering (can block VPN traffic)
     echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true
     echo 0 > /proc/sys/net/ipv4/conf/"$default_interface"/rp_filter 2>/dev/null || true
-    echo 0 > /proc/sys/net/ipv4/conf/"$WG_INTERFACE"/rp_filter 2>/dev/null || true
+    # Note: wg0 interface doesn't exist yet, will be set in post-up
     
     # Additional optimizations for mobile connections
     echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects 2>/dev/null || true
     echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects 2>/dev/null || true
     echo 1 > /proc/sys/net/ipv4/conf/all/accept_source_route 2>/dev/null || true
-    
-    # Enable loose reverse path filtering for VPN interface
-    echo 2 > /proc/sys/net/ipv4/conf/"$WG_INTERFACE"/rp_filter 2>/dev/null || true
     
     # Save iptables rules permanently
     case "$OS" in
@@ -650,7 +651,7 @@ create_inline_commands() {
     fi
     
     # Create enhanced inline post-up commands with multiple safeguards
-    POST_UP_COMMANDS="echo 1 > /proc/sys/net/ipv4/ip_forward; echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 0 > /proc/sys/net/ipv4/conf/$default_interface/rp_filter; iptables -I INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -I FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -s $VPN_NETWORK -j ACCEPT; iptables -I FORWARD -d $VPN_NETWORK -j ACCEPT; iptables -t nat -I POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -t nat -I POSTROUTING -s $VPN_NETWORK ! -d $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    POST_UP_COMMANDS="echo 1 > /proc/sys/net/ipv4/ip_forward; echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 0 > /proc/sys/net/ipv4/conf/$default_interface/rp_filter; echo 2 > /proc/sys/net/ipv4/conf/$WG_INTERFACE/rp_filter; iptables -I INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -I FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -s $VPN_NETWORK -j ACCEPT; iptables -I FORWARD -d $VPN_NETWORK -j ACCEPT; iptables -t nat -I POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -t nat -I POSTROUTING -s $VPN_NETWORK ! -d $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
     
     # Create enhanced inline post-down commands
     POST_DOWN_COMMANDS="iptables -D INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -D FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -D FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -D FORWARD -s $VPN_NETWORK -j ACCEPT; iptables -D FORWARD -d $VPN_NETWORK -j ACCEPT; iptables -t nat -D POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -t nat -D POSTROUTING -s $VPN_NETWORK ! -d $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
@@ -1479,7 +1480,8 @@ main() {
     echo
     echo -e "${CYAN}=== МОНИТОРИНГ ПОДКЛЮЧЕНИЙ КЛИЕНТОВ ===${NC}"
     echo -e "${YELLOW}Для диагностики проблем с интернетом запустите:${NC}"
-    echo -e "  ${GREEN}sudo bash $0 --monitor${NC}"
+    echo -e "  ${GREEN}sudo bash $0 --test-client${NC}  (интерактивный тест с подключенным телефоном)"
+    echo -e "  ${GREEN}sudo bash $0 --monitor${NC}      (мониторинг подключений)"
     echo
     echo -e "${YELLOW}Или проверьте подключения вручную:${NC}"
     echo -e "  ${GREEN}watch -n 2 'wg show && echo && iptables -t nat -L POSTROUTING -n -v | head -10'${NC}"
@@ -1608,6 +1610,107 @@ diagnose_client_connection() {
     return 0
 }
 
+# Function to test actual client connectivity when phone is connected
+test_real_client_connectivity() {
+    log "INFO" "Проверка реального подключения клиента..."
+    
+    # Wait for client to connect
+    echo -e "${YELLOW}Подключите телефон к VPN и нажмите Enter для продолжения...${NC}"
+    read -p ""
+    
+    # Check if any clients are connected
+    local connected_clients=$(wg show wg0 peers 2>/dev/null | wc -l)
+    if [[ "$connected_clients" -eq 0 ]]; then
+        log "ERROR" "Нет подключенных клиентов"
+        return 1
+    fi
+    
+    log "INFO" "Найдено подключенных клиентов: $connected_clients"
+    
+    # Get client IP and test connectivity
+    local client_ip=""
+    while read -r line; do
+        if [[ "$line" =~ allowed\ ips:\ ([0-9.]+)/32 ]]; then
+            client_ip="${BASH_REMATCH[1]}"
+            break
+        fi
+    done < <(wg show wg0)
+    
+    if [[ -z "$client_ip" ]]; then
+        log "ERROR" "Не удалось определить IP клиента"
+        return 1
+    fi
+    
+    log "INFO" "IP подключенного клиента: $client_ip"
+    
+    # Test 1: Ping to client
+    log "INFO" "Тест 1: Ping к клиенту $client_ip"
+    if ping -c 3 -W 2 "$client_ip" >/dev/null 2>&1; then
+        log "SUCCESS" "✅ Ping к клиенту успешен"
+    else
+        log "ERROR" "❌ Ping к клиенту неуспешен"
+    fi
+    
+    # Test 2: Check if client can reach server
+    log "INFO" "Тест 2: Попросите клиента выполнить ping 10.0.0.1"
+    echo -e "${CYAN}На телефоне откройте терминал/приложение и выполните: ping 10.0.0.1${NC}"
+    echo -e "${CYAN}Или откройте браузер и зайдите на http://10.0.0.1${NC}"
+    read -p "Нажмите Enter когда выполните тест..."
+    
+    # Test 3: Check NAT is working for real traffic
+    log "INFO" "Тест 3: Проверка NAT для реального трафика клиента"
+    local nat_packets_before=$(iptables -t nat -L POSTROUTING -n -v | grep "$VPN_NETWORK" | head -1 | awk '{print $1}')
+    
+    echo -e "${CYAN}На телефоне откройте браузер и зайдите на https://whatismyipaddress.com${NC}"
+    echo -e "${CYAN}IP должен показать: $SERVER_PUBLIC_IP${NC}"
+    read -p "Какой IP показывает сайт? " shown_ip
+    
+    if [[ "$shown_ip" == "$SERVER_PUBLIC_IP" ]]; then
+        log "SUCCESS" "✅ NAT работает правильно - показывает IP сервера"
+    else
+        log "ERROR" "❌ NAT НЕ работает - показывает неправильный IP: $shown_ip"
+        log "ERROR" "Ожидался: $SERVER_PUBLIC_IP"
+    fi
+    
+    # Test 4: Check packet counters
+    local nat_packets_after=$(iptables -t nat -L POSTROUTING -n -v | grep "$VPN_NETWORK" | head -1 | awk '{print $1}')
+    log "INFO" "Пакетов через NAT: до=$nat_packets_before, после=$nat_packets_after"
+    
+    if [[ "$nat_packets_after" -gt "$nat_packets_before" ]]; then
+        log "SUCCESS" "✅ Трафик проходит через NAT"
+    else
+        log "WARN" "⚠️  Трафик может не проходить через NAT"
+    fi
+    
+    # Test 5: Show WireGuard transfer stats
+    log "INFO" "Статистика передачи данных WireGuard:"
+    wg show wg0 transfer
+    
+    # Test 6: Show current connections from client
+    log "INFO" "Активные соединения от клиента:"
+    conntrack -L -s "$client_ip" 2>/dev/null | head -10 || log "INFO" "Нет активных соединений"
+    
+    # Test 7: DNS test from server to client
+    log "INFO" "Тест DNS через VPN..."
+    echo -e "${CYAN}На телефоне попробуйте открыть https://google.com${NC}"
+    echo -e "${CYAN}Работает ли интернет через VPN? [y/N]${NC}"
+    read -p "" internet_works
+    
+    if [[ "$internet_works" =~ ^[Yy]$ ]]; then
+        log "SUCCESS" "🎉 VPN РАБОТАЕТ! Интернет доступен через VPN"
+        return 0
+    else
+        log "ERROR" "❌ VPN НЕ РАБОТАЕТ - интернет недоступен"
+        
+        # Additional diagnostics
+        log "INFO" "Дополнительная диагностика:"
+        log "INFO" "Проверьте что DNS сервер доступен с клиента:"
+        echo -e "${CYAN}На телефоне выполните: nslookup google.com 1.1.1.1${NC}"
+        
+        return 1
+    fi
+}
+
 # Show usage information
 show_usage() {
     echo "Использование: $0 [ОПЦИИ]"
@@ -1666,6 +1769,14 @@ case "${1:-}" in
             echo "Укажите IP клиента для диагностики: $0 --diagnose 10.0.0.2"
             exit 1
         fi
+        exit 0
+        ;;
+    --test-client)
+        if [[ $EUID -ne 0 ]]; then
+            echo "Тест клиента требует права root. Используйте: sudo $0 --test-client"
+            exit 1
+        fi
+        test_real_client_connectivity
         exit 0
         ;;
     "")
