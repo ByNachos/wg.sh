@@ -490,61 +490,71 @@ setup_firewall() {
 create_post_scripts() {
     log "STEP" "Создание post-up и post-down скриптов..."
     
-    # Create post-up script
-    cat > "$CONFIG_DIR/post-up.sh" << 'EOF'
+    # Create post-up script with correct variables
+    cat > "$CONFIG_DIR/post-up.sh" << EOF
 #!/bin/bash
 # WireGuard Post-Up Script - Enable routing and NAT
 set -e
+
+# Variables for this configuration
+WG_INTERFACE="$WG_INTERFACE"
+WG_PORT="$WG_PORT"
+VPN_NETWORK="$VPN_NETWORK"
 
 # Enable IP forwarding
 echo 1 > /proc/sys/net/ipv4/ip_forward
 
 # Set optimal MTU
-ip link set dev %i mtu 1342
+ip link set dev \$WG_INTERFACE mtu $OPTIMAL_MTU
 
 # Allow WireGuard traffic through firewall
-iptables -I INPUT -p udp --dport %i -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p udp --dport \$WG_PORT -j ACCEPT 2>/dev/null || true
 
 # Allow forwarding for VPN interface
-iptables -I FORWARD -i %i -j ACCEPT 2>/dev/null || true
-iptables -I FORWARD -o %i -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -i \$WG_INTERFACE -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -o \$WG_INTERFACE -j ACCEPT 2>/dev/null || true
 
 # Enable NAT/MASQUERADE for internet access
-iptables -t nat -I POSTROUTING -s 10.0.0.0/24 -o $(ip route | awk '/default/ {print $5; exit}') -j MASQUERADE 2>/dev/null || true
+DEFAULT_INTERFACE=\$(ip route | awk '/default/ {print \$5; exit}')
+iptables -t nat -I POSTROUTING -s \$VPN_NETWORK -o \$DEFAULT_INTERFACE -j MASQUERADE 2>/dev/null || true
 
 # Allow established and related connections
 iptables -I FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
 # Log successful execution
-echo "$(date): WireGuard post-up completed successfully" >> /var/log/wireguard.log
+echo "\$(date): WireGuard post-up completed successfully for \$WG_INTERFACE" >> /var/log/wireguard.log
 EOF
 
-    # Create post-down script
-    cat > "$CONFIG_DIR/post-down.sh" << 'EOF'
+    # Create post-down script with correct variables
+    cat > "$CONFIG_DIR/post-down.sh" << EOF
 #!/bin/bash
 # WireGuard Post-Down Script - Clean up routing and NAT
 set -e
 
+# Variables for this configuration
+WG_INTERFACE="$WG_INTERFACE"
+WG_PORT="$WG_PORT"
+VPN_NETWORK="$VPN_NETWORK"
+
 # Remove firewall rules (ignore errors if rules don't exist)
-iptables -D INPUT -p udp --dport %i -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
-iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o $(ip route | awk '/default/ {print $5; exit}') -j MASQUERADE 2>/dev/null || true
+iptables -D INPUT -p udp --dport \$WG_PORT -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i \$WG_INTERFACE -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -o \$WG_INTERFACE -j ACCEPT 2>/dev/null || true
+
+# Remove NAT rules
+DEFAULT_INTERFACE=\$(ip route | awk '/default/ {print \$5; exit}')
+iptables -t nat -D POSTROUTING -s \$VPN_NETWORK -o \$DEFAULT_INTERFACE -j MASQUERADE 2>/dev/null || true
 iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
 # Log successful execution
-echo "$(date): WireGuard post-down completed successfully" >> /var/log/wireguard.log
+echo "\$(date): WireGuard post-down completed successfully for \$WG_INTERFACE" >> /var/log/wireguard.log
 EOF
 
     # Make scripts executable
     chmod +x "$CONFIG_DIR/post-up.sh"
     chmod +x "$CONFIG_DIR/post-down.sh"
     
-    # Replace port placeholder with actual port
-    sed -i "s/%i/$WG_PORT/g" "$CONFIG_DIR/post-up.sh"
-    sed -i "s/%i/$WG_PORT/g" "$CONFIG_DIR/post-down.sh"
-    
-    log "SUCCESS" "Post-up и post-down скрипты созданы и настроены"
+    log "SUCCESS" "Post-up и post-down скрипты созданы с правильными переменными"
 }
 
 # Create server configuration
