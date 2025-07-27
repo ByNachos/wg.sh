@@ -78,7 +78,7 @@ print_banner() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║                                                              ║"
-    echo "║        WireGuard Universal Setup Script v3.1 ULTIMATE       ║"
+    echo "║        WireGuard Universal Setup Script v3.2 HOTFIX        ║"
     echo "║                                                              ║"
     echo "║  Автоматическая настройка VPN сервера для всех устройств     ║"
     echo "║  Исправлены все проблемы с интернет-соединением             ║"
@@ -525,8 +525,66 @@ clear_existing_rules() {
 }
 
 # Configure iptables rules - FIXED for proper internet access
+# Check for Docker conflicts
+check_docker_conflicts() {
+    log "INFO" "Проверка конфликтов с Docker..."
+    
+    if systemctl is-active docker >/dev/null 2>&1; then
+        log "WARNING" "Docker активен! Это может вызывать конфликты с VPN"
+        echo -e "${YELLOW}[ВНИМАНИЕ]${NC} Обнаружен активный Docker"
+        echo "Если VPN не работает, попробуйте:"
+        echo "sudo systemctl stop docker"
+        echo "sudo ./wg-universal-setup.sh --test-client"
+        return 1
+    else
+        log "INFO" "Docker не активен - конфликтов не будет"
+        return 0
+    fi
+}
+
+# Check external firewall accessibility
+check_external_firewall() {
+    log "INFO" "Проверка доступности порта $WG_PORT извне..."
+    
+    # Get server public IP
+    local server_ip
+    server_ip=$(curl -s --max-time 10 ifconfig.me 2>/dev/null || curl -s --max-time 10 ipinfo.io/ip 2>/dev/null || echo "unknown")
+    
+    if [[ "$server_ip" == "unknown" ]]; then
+        log "WARNING" "Не удалось определить внешний IP сервера"
+        echo -e "${YELLOW}[ВНИМАНИЕ]${NC} Проверьте firewall вручную:"
+        echo "nmap -p $WG_PORT -sU ВАШ_IP_СЕРВЕРА"
+        return 1
+    fi
+    
+    echo -e "${CYAN}[ПРОВЕРКА]${NC} Тестирование доступности порта $WG_PORT на $server_ip"
+    
+    # Try to check port with timeout
+    if timeout 10 nc -u -z "$server_ip" "$WG_PORT" 2>/dev/null; then
+        log "SUCCESS" "Порт $WG_PORT доступен извне"
+        echo -e "${GREEN}✅ Порт $WG_PORT открыт в облачном firewall${NC}"
+        return 0
+    else
+        log "ERROR" "Порт $WG_PORT недоступен извне!"
+        echo -e "${RED}❌ КРИТИЧЕСКАЯ ОШИБКА: Порт $WG_PORT заблокирован облачным firewall!${NC}"
+        echo ""
+        echo "РЕШЕНИЕ:"
+        echo "1. Откройте порт $WG_PORT UDP в панели управления VPS:"
+        echo "   - AWS: Security Groups"
+        echo "   - DigitalOcean: Firewall Rules"
+        echo "   - Vultr: Firewall"
+        echo "   - Hetzner: Firewall Rules"
+        echo ""
+        echo "2. Проверьте снова: nmap -p $WG_PORT -sU $server_ip"
+        return 1
+    fi
+}
+
 setup_firewall() {
-    log "STEP" "Настройка правил firewall (ИСПРАВЛЕННАЯ ВЕРСИЯ)..."
+    log "STEP" "Настройка правил firewall v3.2 (OPTIMIZED)..."
+    
+    # v3.2 CRITICAL: Check for conflicts first
+    check_docker_conflicts
     
     # Backup existing rules
     iptables-save > "$BACKUP_DIR/iptables-backup-$(date +%Y%m%d-%H%M%S).rules" 2>/dev/null || true
@@ -541,32 +599,18 @@ setup_firewall() {
     fi
     
     log "INFO" "Используется интерфейс для интернета: $default_interface"
+    WAN_INTERFACE="$default_interface"
     
-    # CRITICAL: Multiple MASQUERADE rules for maximum compatibility
-    # Rule 1: Basic MASQUERADE for VPN network
-    iptables -t nat -I POSTROUTING 1 -s "$VPN_NETWORK" -o "$default_interface" -j MASQUERADE
-    
-    # Rule 2: More specific MASQUERADE for non-local traffic
-    iptables -t nat -I POSTROUTING 2 -s "$VPN_NETWORK" ! -d "$VPN_NETWORK" -o "$default_interface" -j MASQUERADE
-    
-    # Rule 3: Catch-all MASQUERADE for any interface (backup)
-    iptables -t nat -A POSTROUTING -s "$VPN_NETWORK" -j MASQUERADE
+    # v3.2 SIMPLIFIED: One correct NAT rule instead of multiple duplicates
+    log "INFO" "Добавление оптимизированного NAT правила (v3.2)..."
+    iptables -t nat -A POSTROUTING -s "$VPN_NETWORK" ! -d "$VPN_NETWORK" -o "$default_interface" -j MASQUERADE
     
     # Allow WireGuard port - essential for VPN connections
-    iptables -I INPUT 1 -p udp --dport "$WG_PORT" -j ACCEPT
+    iptables -I INPUT -p udp --dport "$WG_PORT" -j ACCEPT
     
-    # CRITICAL: Allow ALL traffic from VPN interface (before any DROP policies)
-    iptables -I FORWARD 1 -i "$WG_INTERFACE" -j ACCEPT
-    
-    # CRITICAL: Allow ALL traffic to VPN interface (for return packets)
-    iptables -I FORWARD 2 -o "$WG_INTERFACE" -j ACCEPT
-    
-    # Allow established and related connections (essential for two-way communication)
-    iptables -I FORWARD 3 -m state --state ESTABLISHED,RELATED -j ACCEPT
-    
-    # ADDITIONAL: Ensure no blocking rules affect VPN traffic
-    iptables -I FORWARD 4 -s "$VPN_NETWORK" -j ACCEPT
-    iptables -I FORWARD 5 -d "$VPN_NETWORK" -j ACCEPT
+    # v3.2 SIMPLIFIED FORWARD rules in correct order (only essential rules)
+    iptables -A FORWARD -i "$WG_INTERFACE" -o "$default_interface" -j ACCEPT
+    iptables -A FORWARD -i "$default_interface" -o "$WG_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
     
     # Allow loopback (essential for local services)
     iptables -I INPUT 1 -i lo -j ACCEPT
@@ -630,13 +674,14 @@ setup_firewall() {
             ;;
     esac
     
-    log "SUCCESS" "Правила firewall настроены и сохранены (ИСПРАВЛЕННАЯ ВЕРСИЯ)"
+    # v3.2 CRITICAL: Check external firewall accessibility
+    check_external_firewall
+    
+    log "SUCCESS" "Правила firewall настроены и сохранены (v3.2 OPTIMIZED)"
     log "INFO" "MASQUERADE настроен для интерфейса: $default_interface"
     
-    # Debug: Show current rules
-    log "DEBUG" "Текущие правила iptables (первые 15 строк):"
-    iptables -L -n --line-numbers | head -15 >> "$LOG_FILE" 2>/dev/null || true
-    log "DEBUG" "NAT правила (POSTROUTING):"
+    # Debug: Show current simplified rules
+    log "DEBUG" "Текущие NAT правила (POSTROUTING):"
     iptables -t nat -L POSTROUTING -n -v >> "$LOG_FILE" 2>/dev/null || true
 }
 
@@ -650,11 +695,11 @@ create_inline_commands() {
         default_interface="$WAN_INTERFACE"
     fi
     
-    # Create enhanced inline post-up commands with multiple safeguards
-    POST_UP_COMMANDS="echo 1 > /proc/sys/net/ipv4/ip_forward; echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 0 > /proc/sys/net/ipv4/conf/$default_interface/rp_filter; echo 2 > /proc/sys/net/ipv4/conf/$WG_INTERFACE/rp_filter; iptables -I INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -I FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -I FORWARD -s $VPN_NETWORK -j ACCEPT; iptables -I FORWARD -d $VPN_NETWORK -j ACCEPT; iptables -t nat -I POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -t nat -I POSTROUTING -s $VPN_NETWORK ! -d $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    # v3.2 SIMPLIFIED: Create simplified inline post-up commands (no duplicate NAT rules)
+    POST_UP_COMMANDS="echo 1 > /proc/sys/net/ipv4/ip_forward; echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 0 > /proc/sys/net/ipv4/conf/$default_interface/rp_filter; echo 2 > /proc/sys/net/ipv4/conf/$WG_INTERFACE/rp_filter"
     
-    # Create enhanced inline post-down commands
-    POST_DOWN_COMMANDS="iptables -D INPUT -p udp --dport $WG_PORT -j ACCEPT; iptables -D FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -D FORWARD -o $WG_INTERFACE -j ACCEPT; iptables -D FORWARD -s $VPN_NETWORK -j ACCEPT; iptables -D FORWARD -d $VPN_NETWORK -j ACCEPT; iptables -t nat -D POSTROUTING -s $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -t nat -D POSTROUTING -s $VPN_NETWORK ! -d $VPN_NETWORK -o $default_interface -j MASQUERADE; iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    # v3.2 SIMPLIFIED: Create simplified inline post-down commands (no cleanup of already setup NAT)
+    POST_DOWN_COMMANDS="echo 'WireGuard interface down'"
     
     log "SUCCESS" "Встроенные команды подготовлены для интерфейса: $default_interface"
     log "INFO" "Post-Up: $POST_UP_COMMANDS"
@@ -674,8 +719,8 @@ create_server_config() {
     fi
     
     cat > "$config_file" << EOF
-# WireGuard Server Configuration - ULTIMATE EDITION
-# Generated by wg-universal-setup.sh v3.1 on $(date)
+# WireGuard Server Configuration - v3.2 HOTFIX EDITION
+# Generated by wg-universal-setup.sh v3.2 on $(date)
 # Optimized for all device types with proven values
 # Inline post-up/post-down commands for maximum reliability
 
@@ -1180,7 +1225,7 @@ show_debug_info() {
         echo "    WIREGUARD DEBUG INFORMATION"
         echo "=================================="
         echo "Date: $(date)"
-        echo "Script Version: v3.1 ULTIMATE"
+        echo "Script Version: v3.2 HOTFIX"
         echo "OS: $OS $OS_VERSION"
         echo "WG Interface: $WG_INTERFACE"
         echo "WAN Interface: $WAN_INTERFACE"
@@ -1715,7 +1760,7 @@ test_real_client_connectivity() {
 show_usage() {
     echo "Использование: $0 [ОПЦИИ]"
     echo
-    echo "WireGuard Universal Setup Script v3.1 ULTIMATE"
+    echo "WireGuard Universal Setup Script v3.2 HOTFIX"
     echo "Полностью автоматическая установка и настройка VPN сервера"
     echo
     echo "Опции:"
@@ -1747,7 +1792,7 @@ case "${1:-}" in
         exit 0
         ;;
     -v|--version)
-        echo "WireGuard Universal Setup Script v3.1 ULTIMATE"
+        echo "WireGuard Universal Setup Script v3.2 HOTFIX"
         exit 0
         ;;
     -m|--monitor)
