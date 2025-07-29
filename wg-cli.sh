@@ -1,20 +1,42 @@
 #!/bin/bash
 
-# WireGuard Universal Setup Script - ULTIMATE VERSION
-# One-script solution for complete WireGuard VPN server setup
-# ULTIMATE EDITION: Fixed all connectivity issues + auto-diagnostics
+# WireGuard Universal CLI v4.0 - MINIMALIST EDITION
+# Professional CLI tool for WireGuard VPN server management
+# v4.0: Modern CLI interface with subcommands, config management, diagnostics
 # Author: Senior Shell Developer
 # License: GPL v3
 
 set -euo pipefail
 
-# Color codes for output
+# Application metadata
+readonly APP_NAME="wg-cli"
+readonly APP_VERSION="4.0"
+readonly APP_DESCRIPTION="WireGuard Universal CLI - Professional VPN Management Tool"
+
+# Enhanced color codes for CLI output
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly CYAN='\033[0;36m'
+readonly PURPLE='\033[0;35m'
+readonly WHITE='\033[1;37m'
+readonly GRAY='\033[0;90m'
 readonly NC='\033[0m' # No Color
+
+# CLI-specific formatting
+readonly BOLD='\033[1m'
+readonly DIM='\033[2m'
+readonly UNDERLINE='\033[4m'
+
+# Status indicators (no emojis)
+readonly ICON_SUCCESS="[OK]"
+readonly ICON_ERROR="[ERROR]"
+readonly ICON_WARNING="[WARN]"
+readonly ICON_INFO="[INFO]"
+readonly ICON_ROCKET="[START]"
+readonly ICON_GEAR="[WORK]"
+readonly ICON_SHIELD="[SECURE]"
 
 # Universal optimal configuration values (proven in production)
 readonly OPTIMAL_MTU=1342
@@ -28,9 +50,11 @@ readonly VPN_NETWORK="10.0.0.0/24"
 readonly SERVER_VPN_IP="10.0.0.1"
 
 # File paths
-readonly LOG_FILE="/var/log/wg-universal-setup.log"
+readonly LOG_FILE="/var/log/wg-cli.log"
 readonly CONFIG_DIR="/etc/wireguard"
 readonly BACKUP_DIR="/etc/wireguard/backups"
+readonly CLI_CONFIG_DIR="/etc/wg-cli"
+readonly CLI_CONFIG_FILE="/etc/wg-cli/config.conf"
 
 # Global variables
 WG_INTERFACE=""
@@ -41,7 +65,506 @@ SERVER_PRIVATE_KEY=""
 SERVER_PUBLIC_KEY=""
 CLIENT_COUNT=0
 
-# Logging function with timestamp and colors
+# CLI state variables
+VERBOSE_MODE=false
+QUIET_MODE=false
+CONFIG_FILE=""
+
+#═══════════════════════════════════════════════════════════════════════════════
+# CLI FRAMEWORK FUNCTIONS
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Enhanced logging with CLI-friendly formatting
+cli_log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp=$(date '+%H:%M:%S')
+    
+    # Always log to file
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE" 2>/dev/null || true
+    
+    # Console output based on mode
+    if [[ "$QUIET_MODE" == "true" && "$level" != "ERROR" ]]; then
+        return
+    fi
+    
+    case "$level" in
+        "SUCCESS")
+            echo -e "${GREEN}${ICON_SUCCESS} $message${NC}"
+            ;;
+        "ERROR")
+            echo -e "${RED}${ICON_ERROR} $message${NC}" >&2
+            ;;
+        "WARNING")
+            echo -e "${YELLOW}${ICON_WARNING} $message${NC}"
+            ;;
+        "INFO")
+            echo -e "${CYAN}${ICON_INFO} $message${NC}"
+            ;;
+        "STEP")
+            echo -e "${BLUE}${ICON_GEAR} $message${NC}"
+            ;;
+        "DEBUG")
+            [[ "$VERBOSE_MODE" == "true" ]] && echo -e "${GRAY}[DEBUG] $message${NC}"
+            ;;
+        *)
+            echo "$message"
+            ;;
+    esac
+}
+
+# Progress bar for long operations
+show_progress() {
+    local current="$1"
+    local total="$2"
+    local width=50
+    local percentage=$((current * 100 / total))
+    local completed=$((current * width / total))
+    local remaining=$((width - completed))
+    
+    printf "\r${CYAN}["
+    printf "%0.s█" $(seq 1 $completed)
+    printf "%0.s░" $(seq 1 $remaining)
+    printf "] %d%% ${NC}" $percentage
+    
+    if [[ $current -eq $total ]]; then
+        echo
+    fi
+}
+
+# CLI header for commands
+print_cli_header() {
+    local command="$1"
+    local description="$2"
+    
+    echo
+    echo -e "${BOLD}${WHITE}================================================================${NC}"
+    echo -e "${BOLD}${WHITE} $APP_NAME v$APP_VERSION - $command${NC}"
+    echo -e "${BOLD}${WHITE} $description${NC}"
+    echo -e "${BOLD}${WHITE}================================================================${NC}"
+    echo
+}
+
+# Help system
+show_help() {
+    cat << EOF
+${BOLD}${WHITE}$APP_DESCRIPTION${NC}
+
+${BOLD}USAGE:${NC}
+    $APP_NAME <command> [options]
+
+${BOLD}COMMANDS:${NC}
+    ${GREEN}setup${NC}       ${GRAY}Setup new WireGuard VPN server${NC}
+    ${GREEN}status${NC}      ${GRAY}Show server status and connection info${NC}
+    ${GREEN}monitor${NC}     ${GRAY}Monitor connections in real-time${NC}
+    ${GREEN}diagnose${NC}    ${GRAY}Run comprehensive diagnostics${NC}
+    ${GREEN}clients${NC}     ${GRAY}Manage client configurations${NC}
+    ${GREEN}config${NC}      ${GRAY}Show or edit configuration${NC}
+    ${GREEN}version${NC}     ${GRAY}Show version information${NC}
+    ${GREEN}help${NC}        ${GRAY}Show this help message${NC}
+
+${BOLD}GLOBAL OPTIONS:${NC}
+    ${YELLOW}-v, --verbose${NC}   ${GRAY}Enable verbose output${NC}
+    ${YELLOW}-q, --quiet${NC}     ${GRAY}Suppress non-error output${NC}
+    ${YELLOW}-c, --config${NC}    ${GRAY}Use custom config file${NC}
+
+${BOLD}EXAMPLES:${NC}
+    $APP_NAME setup                 # Setup new VPN server
+    $APP_NAME status                # Check server status
+    $APP_NAME monitor               # Monitor connections
+    $APP_NAME diagnose --fix        # Run diagnostics and auto-fix
+    $APP_NAME clients add john      # Add new client 'john'
+    $APP_NAME config show          # Show current configuration
+
+${BOLD}MORE INFO:${NC}
+    See README.md for detailed documentation
+    Log file: ${LOG_FILE}
+    Config: ${CLI_CONFIG_FILE}
+
+EOF
+}
+
+# Version information
+show_version() {
+    echo -e "${BOLD}$APP_NAME${NC} version ${GREEN}$APP_VERSION${NC}"
+    echo "WireGuard Universal CLI - Professional VPN Management Tool"
+    echo
+    echo "Author: Senior Shell Developer"
+    echo "License: GPL v3"
+    echo "Build: $(date '+%Y%m%d')"
+}
+
+# Initialize CLI config
+init_cli_config() {
+    mkdir -p "$CLI_CONFIG_DIR"
+    
+    if [[ ! -f "$CLI_CONFIG_FILE" ]]; then
+        cat > "$CLI_CONFIG_FILE" << EOF
+# WireGuard CLI Configuration
+# This file is automatically generated
+
+[server]
+interface=wg0
+port=$DEFAULT_PORT
+network=$VPN_NETWORK
+mtu=$OPTIMAL_MTU
+keepalive=$OPTIMAL_KEEPALIVE
+dns=$OPTIMAL_DNS
+
+[cli]
+verbose=false
+auto_backup=true
+check_updates=true
+
+[paths]
+config_dir=$CONFIG_DIR
+backup_dir=$BACKUP_DIR
+log_file=$LOG_FILE
+EOF
+        cli_log "INFO" "Created CLI configuration file: $CLI_CONFIG_FILE"
+    fi
+}
+
+# Load configuration
+load_config() {
+    local config_file="${CONFIG_FILE:-$CLI_CONFIG_FILE}"
+    
+    if [[ -f "$config_file" ]]; then
+        # Simple config parser
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            
+            # Remove sections for simple parsing
+            [[ "$key" =~ ^\[.*\]$ ]] && continue
+            
+            # Set variables based on config
+            case "$key" in
+                "port") WG_PORT="$value" ;;
+                "verbose") [[ "$value" == "true" ]] && VERBOSE_MODE=true ;;
+            esac
+        done < "$config_file"
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# CLI COMMAND HANDLERS
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Setup command - install and configure WireGuard
+cmd_setup() {
+    print_cli_header "SETUP" "Install and configure WireGuard VPN server"
+    
+    cli_log "INFO" "Starting WireGuard VPN server setup..."
+    
+    # Use existing setup logic with CLI progress indicators
+    local steps=10
+    local current=0
+    
+    # System checks
+    ((current++)); show_progress $current $steps
+    check_root
+    
+    ((current++)); show_progress $current $steps
+    detect_os
+    
+    ((current++)); show_progress $current $steps
+    install_packages
+    install_wireguard
+    
+    ((current++)); show_progress $current $steps
+    load_wireguard_module
+    
+    # Network configuration
+    ((current++)); show_progress $current $steps
+    get_server_ip
+    save_server_ip
+    detect_interfaces
+    choose_port
+    
+    ((current++)); show_progress $current $steps
+    generate_keys
+    
+    # System optimization
+    ((current++)); show_progress $current $steps
+    enable_ip_forwarding
+    optimize_tcp_settings
+    
+    ((current++)); show_progress $current $steps
+    setup_firewall
+    
+    # WireGuard configuration
+    ((current++)); show_progress $current $steps
+    create_inline_commands
+    create_server_config
+    create_client_configs
+    
+    # Start and test
+    ((current++)); show_progress $current $steps
+    start_wireguard
+    
+    cli_log "SUCCESS" "WireGuard VPN server setup completed successfully!"
+    cli_log "INFO" "Use '$APP_NAME status' to check server status"
+    cli_log "INFO" "Use '$APP_NAME clients' to manage client configurations"
+}
+
+# Status command - show server status
+cmd_status() {
+    print_cli_header "STATUS" "WireGuard server status and connection info"
+    
+    if ! systemctl is-active wg-quick@wg0 >/dev/null 2>&1; then
+        cli_log "WARNING" "WireGuard service is not running"
+        echo -e "${YELLOW}Run '${BOLD}$APP_NAME setup${NC}${YELLOW}' to install WireGuard${NC}"
+        return 1
+    fi
+    
+    cli_log "SUCCESS" "WireGuard service is active and running"
+    echo
+    
+    # Server information
+    echo -e "${BOLD}${WHITE}Server Information:${NC}"
+    echo -e "  ${CYAN}Interface:${NC} $(ip addr show wg0 2>/dev/null | grep 'inet ' | awk '{print $2}' || echo 'N/A')"
+    echo -e "  ${CYAN}Port:${NC}      $(grep 'ListenPort' $CONFIG_DIR/wg0.conf 2>/dev/null | cut -d'=' -f2 | tr -d ' ' || echo 'N/A')"
+    echo -e "  ${CYAN}Public Key:${NC} $(grep 'PrivateKey' $CONFIG_DIR/wg0.conf 2>/dev/null | cut -d'=' -f2 | tr -d ' ' | wg pubkey 2>/dev/null || echo 'N/A')"
+    echo
+    
+    # Connected clients
+    echo -e "${BOLD}${WHITE}Connected Clients:${NC}"
+    if command -v wg >/dev/null 2>&1; then
+        local clients=$(wg show wg0 2>/dev/null | grep 'peer:' | wc -l || echo 0)
+        if [[ $clients -gt 0 ]]; then
+            wg show wg0 2>/dev/null | grep -A3 'peer:' | while read -r line; do
+                if [[ $line =~ peer: ]]; then
+                    echo -e "  ${GREEN}*${NC} ${line#peer: }"
+                elif [[ $line =~ allowed\ ips: ]]; then
+                    echo -e "    ${GRAY}${line}${NC}"
+                fi
+            done
+        else
+            echo -e "  ${GRAY}No clients connected${NC}"
+        fi
+    else
+        echo -e "  ${GRAY}WireGuard tools not available${NC}"
+    fi
+    echo
+}
+
+# Monitor command - real-time monitoring
+cmd_monitor() {
+    print_cli_header "MONITOR" "Real-time connection monitoring"
+    
+    if ! systemctl is-active wg-quick@wg0 >/dev/null 2>&1; then
+        cli_log "ERROR" "WireGuard service is not running"
+        return 1
+    fi
+    
+    cli_log "INFO" "Starting real-time monitoring (Press Ctrl+C to exit)"
+    echo
+    
+    # Reuse existing monitor function
+    monitor_connections
+}
+
+# Diagnose command - comprehensive diagnostics
+cmd_diagnose() {
+    print_cli_header "DIAGNOSE" "Comprehensive WireGuard diagnostics"
+    
+    local fix_issues=false
+    if [[ "${1:-}" == "--fix" ]]; then
+        fix_issues=true
+        cli_log "INFO" "Auto-fix mode enabled"
+    fi
+    
+    echo -e "${BOLD}${WHITE}System Diagnostics:${NC}"
+    
+    # Check WireGuard installation
+    if command -v wg >/dev/null 2>&1; then
+        cli_log "SUCCESS" "WireGuard tools installed"
+    else
+        cli_log "ERROR" "WireGuard tools not found"
+        [[ "$fix_issues" == "true" ]] && install_wireguard
+    fi
+    
+    # Check service status
+    if systemctl is-active wg-quick@wg0 >/dev/null 2>&1; then
+        cli_log "SUCCESS" "WireGuard service is running"
+    else
+        cli_log "ERROR" "WireGuard service is not running"
+        [[ "$fix_issues" == "true" ]] && systemctl start wg-quick@wg0
+    fi
+    
+    # Check configuration files
+    if [[ -f "$CONFIG_DIR/wg0.conf" ]]; then
+        cli_log "SUCCESS" "Server configuration exists"
+    else
+        cli_log "ERROR" "Server configuration missing"
+    fi
+    
+    # Check firewall rules
+    if iptables -t nat -L POSTROUTING -n | grep -q "MASQUERADE"; then
+        cli_log "SUCCESS" "NAT rules configured"
+    else
+        cli_log "ERROR" "NAT rules missing"
+        [[ "$fix_issues" == "true" ]] && setup_firewall
+    fi
+    
+    # Check external connectivity (reuse existing function)
+    check_external_firewall
+    
+    # Run comprehensive test if available
+    if command -v wg >/dev/null 2>&1 && [[ -f "$CONFIG_DIR/wg0.conf" ]]; then
+        echo
+        cli_log "INFO" "Running connectivity tests..."
+        test_connectivity
+    fi
+    
+    echo
+    cli_log "INFO" "Diagnostics completed. Check logs for details: $LOG_FILE"
+}
+
+# Clients command - manage client configurations
+cmd_clients() {
+    local action="${1:-list}"
+    local client_name="${2:-}"
+    
+    case "$action" in
+        "list"|"ls")
+            print_cli_header "CLIENTS" "List all client configurations"
+            if [[ -d "$CONFIG_DIR/clients" ]]; then
+                echo -e "${BOLD}${WHITE}Available Client Configurations:${NC}"
+                for conf in "$CONFIG_DIR/clients"/*.conf; do
+                    if [[ -f "$conf" ]]; then
+                        local name=$(basename "$conf" .conf)
+                        echo -e "  ${GREEN}*${NC} $name"
+                    fi
+                done
+            else
+                cli_log "INFO" "No client configurations found"
+                echo -e "${GRAY}Run '${BOLD}$APP_NAME setup${NC}${GRAY}' to create initial clients${NC}"
+            fi
+            ;;
+        "add")
+            print_cli_header "CLIENTS" "Add new client configuration"
+            if [[ -z "$client_name" ]]; then
+                cli_log "ERROR" "Client name required: $APP_NAME clients add <name>"
+                return 1
+            fi
+            
+            # Check if client already exists
+            if [[ -f "$CONFIG_DIR/clients/${client_name}.conf" ]]; then
+                cli_log "ERROR" "Client '$client_name' already exists"
+                return 1
+            fi
+            
+            # Find next available IP
+            local next_ip=2
+            while [[ -f "$CONFIG_DIR/clients" ]]; do
+                for conf in "$CONFIG_DIR/clients"/*.conf; do
+                    if [[ -f "$conf" ]]; then
+                        local used_ip=$(grep "Address = 10.0.0." "$conf" | cut -d. -f4 | cut -d/ -f1)
+                        if [[ "$used_ip" == "$next_ip" ]]; then
+                            ((next_ip++))
+                            break
+                        fi
+                    fi
+                done
+                break
+            done
+            
+            cli_log "INFO" "Creating client configuration for: $client_name"
+            if generate_client_config "$client_name" "$((next_ip - 1))"; then
+                cli_log "SUCCESS" "Client '$client_name' created successfully"
+                
+                # Add peer to server config if server is running
+                if systemctl is-active wg-quick@wg0 >/dev/null 2>&1; then
+                    local client_pubkey=$(grep "PrivateKey" "$CONFIG_DIR/clients/${client_name}.conf" | cut -d= -f2 | tr -d ' ' | wg pubkey)
+                    wg set wg0 peer "$client_pubkey" allowed-ips "10.0.0.${next_ip}/32" 2>/dev/null || true
+                    cli_log "INFO" "Added peer to running server"
+                fi
+            else
+                cli_log "ERROR" "Failed to create client configuration"
+                return 1
+            fi
+            ;;
+        "remove"|"rm")
+            print_cli_header "CLIENTS" "Remove client configuration"
+            if [[ -z "$client_name" ]]; then
+                cli_log "ERROR" "Client name required: $APP_NAME clients remove <name>"
+                return 1
+            fi
+            
+            # Check if client exists
+            if [[ ! -f "$CONFIG_DIR/clients/${client_name}.conf" ]]; then
+                cli_log "ERROR" "Client '$client_name' not found"
+                return 1
+            fi
+            
+            cli_log "INFO" "Removing client configuration: $client_name"
+            
+            # Remove peer from running server if active
+            if systemctl is-active wg-quick@wg0 >/dev/null 2>&1; then
+                local client_pubkey=$(grep "PrivateKey" "$CONFIG_DIR/clients/${client_name}.conf" | cut -d= -f2 | tr -d ' ' | wg pubkey 2>/dev/null)
+                if [[ -n "$client_pubkey" ]]; then
+                    wg set wg0 peer "$client_pubkey" remove 2>/dev/null || true
+                    cli_log "INFO" "Removed peer from running server"
+                fi
+            fi
+            
+            # Backup and remove config file
+            local backup_file="$BACKUP_DIR/clients/${client_name}-$(date +%Y%m%d-%H%M%S).conf"
+            mkdir -p "$BACKUP_DIR/clients"
+            cp "$CONFIG_DIR/clients/${client_name}.conf" "$backup_file" 2>/dev/null || true
+            rm -f "$CONFIG_DIR/clients/${client_name}.conf"
+            
+            cli_log "SUCCESS" "Client '$client_name' removed successfully"
+            cli_log "INFO" "Backup saved to: $backup_file"
+            ;;
+        *)
+            cli_log "ERROR" "Unknown clients action: $action"
+            echo "Available actions: list, add, remove"
+            return 1
+            ;;
+    esac
+}
+
+# Config command - show or edit configuration
+cmd_config() {
+    local action="${1:-show}"
+    
+    case "$action" in
+        "show")
+            print_cli_header "CONFIG" "Current configuration"
+            if [[ -f "$CLI_CONFIG_FILE" ]]; then
+                echo -e "${BOLD}${WHITE}CLI Configuration (${CLI_CONFIG_FILE}):${NC}"
+                cat "$CLI_CONFIG_FILE"
+                echo
+            fi
+            if [[ -f "$CONFIG_DIR/wg0.conf" ]]; then
+                echo -e "${BOLD}${WHITE}WireGuard Configuration:${NC}"
+                cat "$CONFIG_DIR/wg0.conf"
+            fi
+            ;;
+        "edit")
+            if command -v nano >/dev/null 2>&1; then
+                nano "$CLI_CONFIG_FILE"
+            elif command -v vim >/dev/null 2>&1; then
+                vim "$CLI_CONFIG_FILE"
+            else
+                cli_log "ERROR" "No text editor found (nano/vim)"
+                return 1
+            fi
+            ;;
+        *)
+            cli_log "ERROR" "Unknown config action: $action"
+            echo "Available actions: show, edit"
+            return 1
+            ;;
+    esac
+}
+
+# Logging function with timestamp and colors (legacy compatibility)
 log() {
     local level="$1"
     shift
@@ -562,11 +1085,11 @@ check_external_firewall() {
     # Try to check port with timeout
     if timeout 10 nc -u -z "$server_ip" "$WG_PORT" 2>/dev/null; then
         log "SUCCESS" "Порт $WG_PORT доступен извне"
-        echo -e "${GREEN}✅ Порт $WG_PORT открыт в облачном firewall${NC}"
+        echo -e "${GREEN}[OK] Порт $WG_PORT открыт в облачном firewall${NC}"
         return 0
     else
         log "ERROR" "Порт $WG_PORT недоступен извне!"
-        echo -e "${RED}❌ КРИТИЧЕСКАЯ ОШИБКА: Порт $WG_PORT заблокирован облачным firewall!${NC}"
+        echo -e "${RED}[ERROR] КРИТИЧЕСКАЯ ОШИБКА: Порт $WG_PORT заблокирован облачным firewall!${NC}"
         echo ""
         echo "РЕШЕНИЕ:"
         echo "1. Откройте порт $WG_PORT UDP в панели управления VPS:"
@@ -1133,40 +1656,40 @@ test_connectivity() {
     
     # Check WireGuard is listening
     if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
-        log "DEBUG" "✅ WireGuard слушает на порту $WG_PORT"
+        log "DEBUG" "[OK] WireGuard слушает на порту $WG_PORT"
     else
-        log "DEBUG" "❌ WireGuard не слушает на порту $WG_PORT"
+        log "DEBUG" "[ERROR] WireGuard не слушает на порту $WG_PORT"
         vpn_ready=false
     fi
     
     # Check IP forwarding
     if [[ "$(cat /proc/sys/net/ipv4/ip_forward)" == "1" ]]; then
-        log "DEBUG" "✅ IP forwarding включен"
+        log "DEBUG" "[OK] IP forwarding включен"
     else
-        log "DEBUG" "❌ IP forwarding отключен"
+        log "DEBUG" "[ERROR] IP forwarding отключен"
         vpn_ready=false
     fi
     
     # Check NAT rules
     if iptables -t nat -C POSTROUTING -s "$VPN_NETWORK" -o "$WAN_INTERFACE" -j MASQUERADE 2>/dev/null; then
-        log "DEBUG" "✅ NAT правила настроены"
+        log "DEBUG" "[OK] NAT правила настроены"
     else
-        log "DEBUG" "❌ NAT правила не найдены"
+        log "DEBUG" "[ERROR] NAT правила не найдены"
         vpn_ready=false
     fi
     
     # Check FORWARD rules
     if iptables -C FORWARD -i "$WG_INTERFACE" -j ACCEPT 2>/dev/null; then
-        log "DEBUG" "✅ FORWARD правила настроены"
+        log "DEBUG" "[OK] FORWARD правила настроены"
     else
-        log "DEBUG" "❌ FORWARD правила не найдены"
+        log "DEBUG" "[ERROR] FORWARD правила не найдены"
         vpn_ready=false
     fi
     
     if $vpn_ready; then
-        log "SUCCESS" "✅ VPN полностью готов для подключения клиентов"
+        log "SUCCESS" "[OK] VPN полностью готов для подключения клиентов"
     else
-        log "WARN" "⚠️ Некоторые компоненты VPN настроены неправильно"
+        log "WARN" "[WARN] Некоторые компоненты VPN настроены неправильно"
         all_tests_passed=false
     fi
     
@@ -1400,10 +1923,10 @@ show_setup_summary() {
     echo "  Отладочная информация: tail -f $LOG_FILE"
     echo
     
-    echo -e "${GREEN}✅ VPN сервер готов к работе!${NC}"
-    echo -e "${GREEN}✅ Оптимизирован для всех типов устройств и сетей${NC}"
-    echo -e "${GREEN}✅ Поддерживает WiFi и мобильные соединения${NC}"
-    echo -e "${GREEN}✅ Все клиентские конфигурации содержат правильный IP сервера${NC}"
+    echo -e "${GREEN}[OK] VPN сервер готов к работе!${NC}"
+    echo -e "${GREEN}[OK] Оптимизирован для всех типов устройств и сетей${NC}"
+    echo -e "${GREEN}[OK] Поддерживает WiFi и мобильные соединения${NC}"
+    echo -e "${GREEN}[OK] Все клиентские конфигурации содержат правильный IP сервера${NC}"
     echo
     
     echo -e "${CYAN}Следующие шаги:${NC}"
@@ -1466,11 +1989,11 @@ main() {
     echo -e "${CYAN}=== ДЕТАЛЬНАЯ ДИАГНОСТИКА ===${NC}"
     
     if test_connectivity; then
-        log "SUCCESS" "✅ Все проверки пройдены успешно!"
-        echo -e "${GREEN}✅ VPN сервер полностью функционален и готов к использованию${NC}"
+        log "SUCCESS" "Все проверки пройдены успешно!"
+        echo -e "${GREEN}[OK] VPN сервер полностью функционален и готов к использованию${NC}"
     else
-        log "WARN" "⚠️  Некоторые проблемы были обнаружены, но система попыталась их исправить"
-        echo -e "${YELLOW}⚠️  Рекомендуется проверить детальные логи для анализа${NC}"
+        log "WARN" "Некоторые проблемы были обнаружены, но система попыталась их исправить"
+        echo -e "${YELLOW}[WARN] Рекомендуется проверить детальные логи для анализа${NC}"
         echo -e "${YELLOW}📝 Полная диагностика доступна в: $LOG_FILE${NC}"
         
         # Show quick summary of potential issues
@@ -1479,31 +2002,31 @@ main() {
         
         # Check if interface is up
         if ip link show "$WG_INTERFACE" &>/dev/null; then
-            echo -e "${GREEN}✅ Интерфейс $WG_INTERFACE активен${NC}"
+            echo -e "${GREEN}[OK] Интерфейс $WG_INTERFACE активен${NC}"
         else
-            echo -e "${RED}❌ Интерфейс $WG_INTERFACE не активен${NC}"
+            echo -e "${RED}[ERROR] Интерфейс $WG_INTERFACE не активен${NC}"
         fi
         
         # Check if port is listening
         if netstat -ulpn 2>/dev/null | grep -q ":$WG_PORT " || ss -ulpn 2>/dev/null | grep -q ":$WG_PORT "; then
-            echo -e "${GREEN}✅ Порт $WG_PORT слушается${NC}"
+            echo -e "${GREEN}[OK] Порт $WG_PORT слушается${NC}"
         else
-            echo -e "${RED}❌ Порт $WG_PORT не слушается${NC}"
+            echo -e "${RED}[ERROR] Порт $WG_PORT не слушается${NC}"
         fi
         
         # Check IP forwarding
         if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]]; then
-            echo -e "${GREEN}✅ IP forwarding включен${NC}"
+            echo -e "${GREEN}[OK] IP forwarding включен${NC}"
         else
-            echo -e "${RED}❌ IP forwarding отключен${NC}"
+            echo -e "${RED}[ERROR] IP forwarding отключен${NC}"
         fi
         
         # Check NAT rules
         local nat_rules=$(iptables -t nat -L POSTROUTING -n | grep -c "$VPN_NETWORK" 2>/dev/null || echo "0")
         if [[ "$nat_rules" -gt 0 ]]; then
-            echo -e "${GREEN}✅ NAT правила настроены ($nat_rules правил)${NC}"
+            echo -e "${GREEN}[OK] NAT правила настроены ($nat_rules правил)${NC}"
         else
-            echo -e "${RED}❌ NAT правила отсутствуют${NC}"
+            echo -e "${RED}[ERROR] NAT правила отсутствуют${NC}"
         fi
         
         echo
@@ -1572,9 +2095,9 @@ monitor_connections() {
             # Test internet from server perspective
             echo -e "${YELLOW}Тест интернета с сервера:${NC}"
             if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-                echo -e "  ${GREEN}✅ Сервер имеет доступ к интернету${NC}"
+                echo -e "  ${GREEN}[OK] Сервер имеет доступ к интернету${NC}"
             else
-                echo -e "  ${RED}❌ Сервер НЕ имеет доступа к интернету${NC}"
+                echo -e "  ${RED}[ERROR] Сервер НЕ имеет доступа к интернету${NC}"
             fi
             
             # Check if any VPN client is sending traffic
@@ -1582,15 +2105,15 @@ monitor_connections() {
             local tx_bytes=$(wg show wg0 transfer | awk '{print $3}' | head -1)
             
             if [[ -n "$rx_bytes" && "$rx_bytes" != "0" ]]; then
-                echo -e "  ${GREEN}✅ Клиент отправляет данные (RX: $rx_bytes bytes)${NC}"
+                echo -e "  ${GREEN}[OK] Клиент отправляет данные (RX: $rx_bytes bytes)${NC}"
             else
-                echo -e "  ${YELLOW}⚠️  Клиент не отправляет данные${NC}"
+                echo -e "  ${YELLOW}[WARN]  Клиент не отправляет данные${NC}"
             fi
             
             if [[ -n "$tx_bytes" && "$tx_bytes" != "0" ]]; then
-                echo -e "  ${GREEN}✅ Сервер отправляет данные клиенту (TX: $tx_bytes bytes)${NC}"
+                echo -e "  ${GREEN}[OK] Сервер отправляет данные клиенту (TX: $tx_bytes bytes)${NC}"
             else
-                echo -e "  ${YELLOW}⚠️  Сервер не отправляет данные клиенту${NC}"
+                echo -e "  ${YELLOW}[WARN]  Сервер не отправляет данные клиенту${NC}"
             fi
             
         else
@@ -1691,9 +2214,9 @@ test_real_client_connectivity() {
     # Test 1: Ping to client
     log "INFO" "Тест 1: Ping к клиенту $client_ip"
     if ping -c 3 -W 2 "$client_ip" >/dev/null 2>&1; then
-        log "SUCCESS" "✅ Ping к клиенту успешен"
+        log "SUCCESS" "[OK] Ping к клиенту успешен"
     else
-        log "ERROR" "❌ Ping к клиенту неуспешен"
+        log "ERROR" "[ERROR] Ping к клиенту неуспешен"
     fi
     
     # Test 2: Check if client can reach server
@@ -1711,9 +2234,9 @@ test_real_client_connectivity() {
     read -p "Какой IP показывает сайт? " shown_ip
     
     if [[ "$shown_ip" == "$SERVER_PUBLIC_IP" ]]; then
-        log "SUCCESS" "✅ NAT работает правильно - показывает IP сервера"
+        log "SUCCESS" "[OK] NAT работает правильно - показывает IP сервера"
     else
-        log "ERROR" "❌ NAT НЕ работает - показывает неправильный IP: $shown_ip"
+        log "ERROR" "[ERROR] NAT НЕ работает - показывает неправильный IP: $shown_ip"
         log "ERROR" "Ожидался: $SERVER_PUBLIC_IP"
     fi
     
@@ -1722,9 +2245,9 @@ test_real_client_connectivity() {
     log "INFO" "Пакетов через NAT: до=$nat_packets_before, после=$nat_packets_after"
     
     if [[ "$nat_packets_after" -gt "$nat_packets_before" ]]; then
-        log "SUCCESS" "✅ Трафик проходит через NAT"
+        log "SUCCESS" "[OK] Трафик проходит через NAT"
     else
-        log "WARN" "⚠️  Трафик может не проходить через NAT"
+        log "WARN" "[WARN]  Трафик может не проходить через NAT"
     fi
     
     # Test 5: Show WireGuard transfer stats
@@ -1745,7 +2268,7 @@ test_real_client_connectivity() {
         log "SUCCESS" "🎉 VPN РАБОТАЕТ! Интернет доступен через VPN"
         return 0
     else
-        log "ERROR" "❌ VPN НЕ РАБОТАЕТ - интернет недоступен"
+        log "ERROR" "[ERROR] VPN НЕ РАБОТАЕТ - интернет недоступен"
         
         # Additional diagnostics
         log "INFO" "Дополнительная диагностика:"
@@ -1785,51 +2308,124 @@ save_server_ip() {
     echo "$SERVER_PUBLIC_IP" > /tmp/wg_server_ip 2>/dev/null || true
 }
 
-# Parse command line arguments
-case "${1:-}" in
-    -h|--help)
-        show_usage
-        exit 0
-        ;;
-    -v|--version)
-        echo "WireGuard Universal Setup Script v3.2 HOTFIX"
-        exit 0
-        ;;
-    -m|--monitor)
-        if [[ $EUID -ne 0 ]]; then
-            echo "Мониторинг требует права root. Используйте: sudo $0 --monitor"
+#═══════════════════════════════════════════════════════════════════════════════
+# CLI ARGUMENT PARSING AND DISPATCH
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Parse global options
+parse_global_options() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -v|--verbose)
+                VERBOSE_MODE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET_MODE=true
+                shift
+                ;;
+            -c|--config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            *)
+                # Return non-option arguments
+                echo "$@"
+                return
+                ;;
+        esac
+    done
+}
+
+# Main CLI dispatcher
+cli_main() {
+    # Initialize logging directory
+    mkdir -p "$(dirname "$LOG_FILE")"
+    
+    # Parse global options first
+    local remaining_args
+    remaining_args=$(parse_global_options "$@")
+    set -- $remaining_args
+    
+    # Initialize CLI config
+    init_cli_config
+    load_config
+    
+    # Get command
+    local command="${1:-help}"
+    shift || true
+    
+    # Route to appropriate command handler
+    case "$command" in
+        "setup")
+            check_root
+            cmd_setup "$@"
+            ;;
+        "status")
+            cmd_status "$@"
+            ;;
+        "monitor")
+            check_root
+            cmd_monitor "$@"
+            ;;
+        "diagnose")
+            check_root
+            cmd_diagnose "$@"
+            ;;
+        "clients")
+            cmd_clients "$@"
+            ;;
+        "config")
+            cmd_config "$@"
+            ;;
+        "version")
+            show_version
+            ;;
+        "help"|"-h"|"--help")
+            show_help
+            ;;
+        # Legacy compatibility
+        "--monitor")
+            check_root
+            cmd_monitor
+            ;;
+        "--diagnose")
+            check_root
+            cmd_diagnose --fix
+            ;;
+        "--test-client")
+            check_root
+            test_real_client_connectivity
+            ;;
+        # Legacy main() for backward compatibility
+        "legacy")
+            check_root
+            main
+            ;;
+        *)
+            cli_log "ERROR" "Unknown command: $command"
+            echo
+            echo -e "${BOLD}Available commands:${NC}"
+            echo -e "  ${GREEN}setup${NC}, ${GREEN}status${NC}, ${GREEN}monitor${NC}, ${GREEN}diagnose${NC}, ${GREEN}clients${NC}, ${GREEN}config${NC}, ${GREEN}version${NC}, ${GREEN}help${NC}"
+            echo
+            echo -e "Use '${BOLD}$APP_NAME help${NC}' for detailed usage information"
             exit 1
-        fi
-        monitor_connections
-        exit 0
-        ;;
-    --diagnose)
-        if [[ $EUID -ne 0 ]]; then
-            echo "Диагностика требует права root. Используйте: sudo $0 --diagnose [IP_клиента]"
-            exit 1
-        fi
-        if [[ -n "${2:-}" ]]; then
-            diagnose_client_connection "$2"
-        else
-            echo "Укажите IP клиента для диагностики: $0 --diagnose 10.0.0.2"
-            exit 1
-        fi
-        exit 0
-        ;;
-    --test-client)
-        if [[ $EUID -ne 0 ]]; then
-            echo "Тест клиента требует права root. Используйте: sudo $0 --test-client"
-            exit 1
-        fi
-        test_real_client_connectivity
-        exit 0
-        ;;
-    "")
-        main "$@"
-        ;;
-    *)
-        echo "Неизвестная опция: $1"
-        show_usage
-        exit 1
-        ;;
-esac
+            ;;
+    esac
+}
+
+# Legacy main function (for backward compatibility)
+legacy_main() {
+    main "$@"
+}
+
+# Entry point - dispatch to CLI or legacy mode
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Check if it's being called in legacy mode (no arguments = setup)
+    if [[ $# -eq 0 ]]; then
+        check_root
+        cmd_setup
+    else
+        cli_main "$@"
+    fi
+fi
