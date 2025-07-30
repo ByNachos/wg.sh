@@ -622,13 +622,39 @@ check_root() {
 detect_os() {
     log "STEP" "Определение операционной системы..."
     
+    # Try different methods to detect OS
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         OS=$NAME
         OS_VERSION=$VERSION_ID
         log "INFO" "Операционная система: $OS $OS_VERSION"
+    elif [[ -f /etc/lsb-release ]]; then
+        . /etc/lsb-release
+        OS=$DISTRIB_ID
+        OS_VERSION=$DISTRIB_RELEASE
+        log "INFO" "Операционная система: $OS $OS_VERSION"
+    elif command -v lsb_release >/dev/null 2>&1; then
+        OS=$(lsb_release -si)
+        OS_VERSION=$(lsb_release -sr)
+        log "INFO" "Операционная система: $OS $OS_VERSION"
+    elif [[ "$(uname)" == "Darwin" ]]; then
+        OS="macOS"
+        OS_VERSION=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+        log "WARNING" "Обнаружена macOS - WireGuard работает только на Linux серверах"
+        log "INFO" "Для тестирования на macOS используйте Docker или виртуальную машину"
+        error_exit "Установка WireGuard сервера поддерживается только на Linux"
     else
-        error_exit "Не удалось определить операционную систему"
+        # Fallback detection
+        if command -v apt >/dev/null 2>&1; then
+            OS="Ubuntu/Debian"
+            OS_VERSION="unknown"
+        elif command -v yum >/dev/null 2>&1; then
+            OS="CentOS/RHEL"
+            OS_VERSION="unknown"
+        else
+            error_exit "Не удалось определить операционную систему. Поддерживаются: Ubuntu, Debian, CentOS, RHEL"
+        fi
+        log "INFO" "Операционная система: $OS $OS_VERSION"
     fi
 }
 
